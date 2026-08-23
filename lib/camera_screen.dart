@@ -27,6 +27,7 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen> {
   WebSocketChannel? _channel;
   Uint8List? _currentFrame;
+  String _serverIp = '10.0.2.2'; // Default for Android Emulator. Use 127.0.0.1 for Windows Desktop.
 
   final FallDetectionLogic _fallDetectionLogic = FallDetectionLogic();
   final FirebaseService _firebaseService = FirebaseService();
@@ -41,9 +42,6 @@ class _CameraScreenState extends State<CameraScreen> {
   String _currentStatusMessage = 'Connecting to PC Backend...';
   Color _currentStatusColor = Colors.grey.withValues(alpha: 0.8);
   DateTime? _statusEndTime;
-  Pose? _currentPose;
-  Size? _imageSize;
-  InputImageRotation _rotation = InputImageRotation.rotation0deg;
 
   @override
   void initState() {
@@ -54,8 +52,9 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   void _connectWebSocket() {
+    _channel?.sink.close(); // Close existing if any
     try {
-      _channel = WebSocketChannel.connect(Uri.parse('ws://127.0.0.1:8765'));
+      _channel = WebSocketChannel.connect(Uri.parse('ws://$_serverIp:8765'));
       _channel!.stream.listen((message) {
         if (!mounted) return;
         try {
@@ -65,8 +64,6 @@ class _CameraScreenState extends State<CameraScreen> {
           final imageBytes = base64Decode(base64Image);
           
           final poseData = data['pose'] as List<dynamic>;
-          final imageWidth = (data['image_width'] as num).toDouble();
-          final imageHeight = (data['image_height'] as num).toDouble();
           
           Pose? pose;
           if (poseData.isNotEmpty) {
@@ -77,8 +74,6 @@ class _CameraScreenState extends State<CameraScreen> {
           
           setState(() {
             _currentFrame = imageBytes;
-            _currentPose = pose;
-            _imageSize = Size(imageWidth, imageHeight);
             _currentStatusMessage = _baselineService.isCalibrating 
                 ? 'Calibrating...' 
                 : 'Monitoring...';
@@ -207,11 +202,57 @@ class _CameraScreenState extends State<CameraScreen> {
     super.dispose();
   }
 
+  void _showIpDialog() {
+    TextEditingController ipController = TextEditingController(text: _serverIp);
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text("Set Backend IP Address"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: ipController,
+                decoration: const InputDecoration(labelText: "IP Address"),
+              ),
+              const SizedBox(height: 8),
+              const Text("10.0.2.2 = Android Emulator\n127.0.0.1 = Windows Desktop\n192.168.x.x = Real Phone on WiFi", style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                setState(() {
+                  _serverIp = ipController.text;
+                });
+                Navigator.pop(context);
+                _connectWebSocket();
+              },
+              child: const Text("Connect"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: const Text('PatientWatch - PC Backend'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Change IP Address',
+            onPressed: _showIpDialog,
+          )
+        ],
       ),
       body: Stack(
         fit: StackFit.expand,
@@ -228,9 +269,6 @@ class _CameraScreenState extends State<CameraScreen> {
               child: Text("Waiting for Python Backend... (Run main.py)"),
             ),
 
-          // We don't need PosePainter anymore because python draws the points directly on the image!
-          // But if we wanted to draw Flutter UI over it, we could. Python already draws face/hands/pose perfectly.
-          
           // Status Indicator
           Positioned(
             top: 20,
