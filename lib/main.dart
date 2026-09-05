@@ -3,7 +3,7 @@ import 'package:camera/camera.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'screens/login_screen.dart';
-import 'screens/multi_patient_dashboard.dart';
+import 'screens/main_navigation.dart';
 
 List<CameraDescription> cameras = [];
 
@@ -41,7 +41,7 @@ class MyApp extends StatelessWidget {
             );
           }
           if (snapshot.hasData) {
-            return const MultiPatientDashboard();
+            return const MainNavigation();
           }
           return const LoginScreen();
         },

@@ -5,7 +5,6 @@ import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 
 class ReportService {
-  static const String geminiApiKey = "my api key";
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
 
   Future<String> generateDailyReport(String deviceId, DateTime date) async {
@@ -99,8 +98,18 @@ class ReportService {
   }
 
   Future<String> _callGeminiApi(String rawDataString) async {
-    if (geminiApiKey == "YOUR_GEMINI_API_KEY_HERE" || geminiApiKey.isEmpty) {
-      return "Gemini API key not configured. Raw events:\n$rawDataString";
+    String geminiApiKey = "";
+    try {
+      final doc = await _firestore.collection('config').doc('gemini').get();
+      if (doc.exists && doc.data() != null) {
+        geminiApiKey = doc.data()!['api_key'] ?? "";
+      }
+    } catch (e) {
+      debugPrint("Error fetching Gemini API key: $e");
+    }
+
+    if (geminiApiKey.isEmpty) {
+      return "Gemini API key not configured in the PC Dashboard Settings. Please add it and try again. Raw events:\n$rawDataString";
     }
 
     final url = Uri.parse(

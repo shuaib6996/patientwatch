@@ -1,0 +1,207 @@
+import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:intl/intl.dart';
+import '../models/patient.dart';
+import '../models/staff.dart';
+import '../services/auth_service.dart';
+import 'live_camera_view.dart';
+
+class AlertFeedScreen extends StatefulWidget {
+  const AlertFeedScreen({Key? key}) : super(key: key);
+
+  @override
+  State<AlertFeedScreen> createState() => _AlertFeedScreenState();
+}
+
+class _AlertFeedScreenState extends State<AlertFeedScreen> {
+  final AuthService _authService = AuthService();
+  Staff? _currentStaff;
+  bool _isLoadingStaff = true;
+  List<Patient> _allPatients = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadInitialData();
+  }
+
+  Future<void> _loadInitialData() async {
+    try {
+      final user = _authService.getCurrentUser();
+      if (user != null) {
+        final doc = await FirebaseFirestore.instance.collection('staff').doc(user.uid).get();
+        if (doc.exists) {
+          _currentStaff = Staff.fromMap(doc.data()!, doc.id);
+        }
+      }
+      
+      // Pre-load patients for fast lookups
+      final patientsSnap = await FirebaseFirestore.instance.collection('patients').get();
+      _allPatients = patientsSnap.docs.map((d) => Patient.fromFirestore(d)).toList();
+    } catch (e) {
+      debugPrint("Error loading initial data: $e");
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoadingStaff = false;
+        });
+      }
+    }
+  }
+
+  Patient? _getPatientByDeviceId(String deviceId) {
+    try {
+      return _allPatients.firstWhere((p) => p.deviceId == deviceId);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  Color _getEventColor(String type) {
+    switch (type.toLowerCase()) {
+      case 'fall':
+        return Colors.red;
+      case 'restless_movement':
+        return Colors.orange;
+      case 'prolonged_stillness':
+        return Colors.blue;
+      case 'bed_exit':
+        return Colors.grey;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  IconData _getEventIcon(String type) {
+    switch (type.toLowerCase()) {
+      case 'fall':
+        return Icons.warning_rounded;
+      case 'restless_movement':
+        return Icons.directions_run;
+      case 'prolonged_stillness':
+        return Icons.bedtime;
+      case 'bed_exit':
+        return Icons.exit_to_app;
+      default:
+        return Icons.info;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoadingStaff) {
+      return const Center(child: CircularProgressIndicator());
+    }
+
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+          color: Colors.grey.shade200,
+          child: const Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('Live Alert Feed',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              Row(
+                children: [
+                  Icon(Icons.circle, color: Colors.green, size: 12),
+                  SizedBox(width: 4),
+                  Text('Connected', style: TextStyle(fontSize: 12)),
+                ],
+              )
+            ],
+          ),
+        ),
+        Expanded(
+          child: StreamBuilder<QuerySnapshot>(
+            stream: FirebaseFirestore.instance
+                .collection('patient_events')
+                .orderBy('timestamp', descending: true)
+                .limit(100)
+                .snapshots(),
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(child: CircularProgressIndicator());
+              }
+
+              if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+                return const Center(child: Text('No recent alerts.'));
+              }
+
+              var events = snapshot.data!.docs;
+
+              // Role-based filtering
+              if (_currentStaff != null &&
+                  _currentStaff!.role != 'admin' &&
+                  _currentStaff!.assignedRooms.isNotEmpty) {
+                events = events.where((doc) {
+                  final data = doc.data() as Map<String, dynamic>;
+                  final p = _getPatientByDeviceId(data['deviceId'] ?? '');
+                  if (p == null) return false;
+                  return _currentStaff!.assignedRooms.contains(p.roomNumber);
+                }).toList();
+              }
+
+              if (events.isEmpty) {
+                return const Center(
+                    child: Text('No alerts for your assigned rooms.'));
+              }
+
+              return ListView.builder(
+                itemCount: events.length,
+                itemBuilder: (context, index) {
+                  final data = events[index].data() as Map<String, dynamic>;
+                  final type = data['eventType'] ?? 'Unknown';
+                  final deviceId = data['deviceId'] ?? '';
+                  final timestamp = data['timestamp'] as Timestamp?;
+
+                  final patient = _getPatientByDeviceId(deviceId);
+                  final title = patient != null
+                      ? '${patient.name} (Rm: ${patient.roomNumber})'
+                      : 'Unknown Patient ($deviceId)';
+
+                  final timeStr = timestamp != null
+                      ? DateFormat('HH:mm:ss').format(timestamp.toDate())
+                      : '';
+
+                  return Card(
+                    margin:
+                        const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: _getEventColor(type).withOpacity(0.2),
+                        child: Icon(_getEventIcon(type),
+                            color: _getEventColor(type)),
+                      ),
+                      title: Text(title,
+                          style: const TextStyle(fontWeight: FontWeight.bold)),
+                      subtitle: Text(type.replaceAll('_', ' ').toUpperCase()),
+                      trailing: Text(timeStr),
+                      onTap: () {
+                        if (patient != null) {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                                builder: (context) =>
+                                    LiveCameraView(patient: patient)),
+                          );
+                        } else {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                                content: Text(
+                                    'Cannot view camera: Patient data missing.')),
+                          );
+                        }
+                      },
+                    ),
+                  );
+                },
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
