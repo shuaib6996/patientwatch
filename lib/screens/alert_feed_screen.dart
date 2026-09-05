@@ -170,7 +170,7 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
                         const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                     child: ListTile(
                       leading: CircleAvatar(
-                        backgroundColor: _getEventColor(type).withOpacity(0.2),
+                        backgroundColor: _getEventColor(type).withValues(alpha: 0.2),
                         child: Icon(_getEventIcon(type),
                             color: _getEventColor(type)),
                       ),

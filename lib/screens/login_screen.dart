@@ -62,7 +62,10 @@ class _LoginScreenState extends State<LoginScreen> {
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const Icon(Icons.monitor_heart, size: 80, color: Colors.blue),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(20),
+                child: Image.asset('assets/images/logo.jpg', height: 120, width: 120, fit: BoxFit.contain),
+              ),
               const SizedBox(height: 24),
               Text(
                 _isLoginMode ? 'Staff Login' : 'Staff Sign Up',

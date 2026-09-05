@@ -3,7 +3,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import '../models/patient.dart';
 import '../models/staff.dart';
 import '../services/auth_service.dart';
-import 'live_camera_view.dart';
 import '../camera_screen.dart';
 import '../main.dart';
 
