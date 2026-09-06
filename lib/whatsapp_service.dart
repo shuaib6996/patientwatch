@@ -15,6 +15,18 @@ class WhatsAppService {
     String messageContent = '';
     if (eventType == 'fall') {
       messageContent = '⚠️ Fall Alert: Patient fall detected at $formattedTime.';
+    } else if (eventType == 'emergency_help_wave') {
+      messageContent = '🚨 URGENT: Patient is waving for emergency doctor / help at $formattedTime! Please attend immediately.';
+    } else if (eventType == 'washroom_request') {
+      messageContent = '🚻 ASSISTANCE: Patient requests washroom / toilet assistance at $formattedTime.';
+    } else if (eventType == 'water_request') {
+      messageContent = '💧 ASSISTANCE: Patient is requesting water / hydration at $formattedTime.';
+    } else if (eventType == 'blanket_request') {
+      messageContent = '🛌 COMFORT: Patient feeling cold / requesting blanket at $formattedTime.';
+    } else if (eventType == 'chest_pain_distress') {
+      messageContent = '⚠️ MEDICAL ATTENTION: Patient clutching chest / acute pain reported at $formattedTime.';
+    } else if (eventType == 'bed_exit') {
+      messageContent = '⚠️ Bed Exit Alert: Patient attempting to exit bed at $formattedTime.';
     } else if (eventType == 'prolonged_stillness') {
       messageContent = '⚠️ No movement detected for 15+ minutes at $formattedTime. Please check on patient.';
     } else if (eventType == 'restless_movement') {

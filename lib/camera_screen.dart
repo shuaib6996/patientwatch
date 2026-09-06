@@ -5,6 +5,7 @@ import 'package:camera/camera.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'fall_detection_logic.dart';
+import 'gesture_detection_logic.dart';
 import 'firebase_service.dart';
 import 'whatsapp_service.dart';
 import 'services/baseline_service.dart';
@@ -30,6 +31,7 @@ class _CameraScreenState extends State<CameraScreen> {
   String _serverIp = '10.0.2.2'; // Default for Android Emulator. Use 127.0.0.1 for Windows Desktop.
 
   final FallDetectionLogic _fallDetectionLogic = FallDetectionLogic();
+  final GestureDetectionLogic _gestureDetectionLogic = GestureDetectionLogic();
   final FirebaseService _firebaseService = FirebaseService();
   final WhatsAppService _whatsappService = WhatsAppService();
 
@@ -129,6 +131,29 @@ class _CameraScreenState extends State<CameraScreen> {
       _baselineService.processPoseForCalibration(pose);
     } else {
       await _activityClassifier.classifyActivity(pose, widget.patient.deviceId);
+
+      // Check Level 1 Active Gestures (Calling Doctor, Washroom, Water, Blanket, Chest Pain)
+      final gestureResult = _gestureDetectionLogic.detectGesture(pose);
+      if (gestureResult.gesture != DetectedGesture.none) {
+        Color gestureColor = Colors.orange;
+        if (gestureResult.gesture == DetectedGesture.emergencyHelpWave) {
+          gestureColor = Colors.red;
+        } else if (gestureResult.gesture == DetectedGesture.waterRequest) {
+          gestureColor = Colors.blue;
+        } else if (gestureResult.gesture == DetectedGesture.washroomRequest) {
+          gestureColor = Colors.amber.shade800;
+        } else if (gestureResult.gesture == DetectedGesture.blanketRequest) {
+          gestureColor = Colors.teal;
+        } else if (gestureResult.gesture == DetectedGesture.chestPainDistress) {
+          gestureColor = Colors.deepOrange;
+        }
+
+        _handleEventDetected(
+          gestureResult.eventType,
+          gestureResult.displayTitle,
+          gestureColor.withValues(alpha: 0.95),
+        );
+      }
 
       final isBedExit = _bedExitDetector.detectBedExit(
           pose,

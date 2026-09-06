@@ -60,15 +60,24 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
   Color _getEventColor(String type) {
     switch (type.toLowerCase()) {
       case 'fall':
+      case 'emergency_help_wave':
         return Colors.red;
-      case 'restless_movement':
-        return Colors.orange;
-      case 'prolonged_stillness':
+      case 'chest_pain_distress':
+        return Colors.deepOrange;
+      case 'washroom_request':
+        return Colors.amber.shade800;
+      case 'water_request':
         return Colors.blue;
+      case 'blanket_request':
+        return Colors.teal;
       case 'bed_exit':
-        return Colors.grey;
+        return Colors.orange;
+      case 'restless_movement':
+        return Colors.purple;
+      case 'prolonged_stillness':
+        return Colors.indigo;
       default:
-        return Colors.grey;
+        return Colors.blueGrey;
     }
   }
 
@@ -76,14 +85,49 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
     switch (type.toLowerCase()) {
       case 'fall':
         return Icons.warning_rounded;
+      case 'emergency_help_wave':
+        return Icons.waving_hand;
+      case 'chest_pain_distress':
+        return Icons.healing;
+      case 'washroom_request':
+        return Icons.wc;
+      case 'water_request':
+        return Icons.local_drink;
+      case 'blanket_request':
+        return Icons.airline_seat_individual_suite;
+      case 'bed_exit':
+        return Icons.exit_to_app;
       case 'restless_movement':
         return Icons.directions_run;
       case 'prolonged_stillness':
         return Icons.bedtime;
-      case 'bed_exit':
-        return Icons.exit_to_app;
       default:
-        return Icons.info;
+        return Icons.notifications_active;
+    }
+  }
+
+  String _formatEventLabel(String type) {
+    switch (type.toLowerCase()) {
+      case 'emergency_help_wave':
+        return '🚨 URGENT: Calling Doctor / Help';
+      case 'washroom_request':
+        return '🚻 Washroom / Toilet Assistance';
+      case 'water_request':
+        return '💧 Water / Thirst Assistance';
+      case 'blanket_request':
+        return '🛌 Blanket / Cold Comfort';
+      case 'chest_pain_distress':
+        return '⚠️ Chest Pain Distress Reported';
+      case 'fall':
+        return '⚠️ Fall Detected';
+      case 'bed_exit':
+        return '⚠️ Bed Exit Attempt';
+      case 'restless_movement':
+        return 'Restless Movement';
+      case 'prolonged_stillness':
+        return 'Prolonged Stillness';
+      default:
+        return type.replaceAll('_', ' ').toUpperCase();
     }
   }
 
@@ -259,7 +303,10 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
                       ),
                       title: Text(title,
                           style: const TextStyle(fontWeight: FontWeight.bold)),
-                      subtitle: Text(type.replaceAll('_', ' ').toUpperCase()),
+                      subtitle: Text(_formatEventLabel(type),
+                          style: TextStyle(
+                              color: _getEventColor(type),
+                              fontWeight: FontWeight.w600)),
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
