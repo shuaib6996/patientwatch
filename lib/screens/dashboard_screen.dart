@@ -306,6 +306,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
               title: Text(eventName),
               subtitle: Text(timeStr),
               dense: true,
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+                tooltip: 'Delete Event',
+                onPressed: () async {
+                  await snapshot.data!.docs[index].reference.delete();
+                },
+              ),
             );
           },
         );
@@ -344,6 +351,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
             return ExpansionTile(
               title: Text('Report: $dateStr'),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+                tooltip: 'Delete Report',
+                onPressed: () async {
+                  await snapshot.data!.docs[index].reference.delete();
+                },
+              ),
               children: [
                 Padding(
                   padding: const EdgeInsets.all(16.0),

@@ -82,14 +82,25 @@ class _PatientListScreenState extends State<PatientListScreen> {
               child: ListTile(
                 title: Text(patient.name, style: const TextStyle(fontWeight: FontWeight.bold)),
                 subtitle: Text('Room: ${patient.roomNumber} | Bed: ${patient.bedNumber}'),
-                trailing: ElevatedButton(
-                  onPressed: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(builder: (context) => CameraScreen(cameras: cameras, patient: patient)),
-                    );
-                  },
-                  child: const Text('View Live'),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ElevatedButton(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (context) => CameraScreen(cameras: cameras, patient: patient)),
+                        );
+                      },
+                      child: const Text('View Live'),
+                    ),
+                    const SizedBox(width: 6),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline, color: Colors.red),
+                      tooltip: 'Delete Patient',
+                      onPressed: () => _confirmDeletePatient(context, patient),
+                    ),
+                  ],
                 ),
                 onTap: () {
                   Navigator.push(
@@ -103,5 +114,40 @@ class _PatientListScreenState extends State<PatientListScreen> {
         );
       },
     );
+  }
+
+  Future<void> _confirmDeletePatient(BuildContext context, Patient patient) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Patient'),
+        content: Text('Are you sure you want to delete patient "${patient.name}" from the system?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldDelete == true) {
+      try {
+        await FirebaseFirestore.instance.collection('patients').doc(patient.patientId).delete();
+        messenger.showSnackBar(
+          SnackBar(content: Text('Patient "${patient.name}" deleted successfully.')),
+        );
+      } catch (e) {
+        messenger.showSnackBar(
+          SnackBar(content: Text('Failed to delete patient: $e')),
+        );
+      }
+    }
   }
 }

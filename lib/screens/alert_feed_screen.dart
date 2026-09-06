@@ -87,6 +87,81 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
     }
   }
 
+  Future<void> _confirmDeleteAlert(BuildContext context, DocumentReference ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Alert'),
+        content: const Text('Are you sure you want to delete this notification?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldDelete == true) {
+      try {
+        await ref.delete();
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Alert deleted successfully.')),
+        );
+      } catch (e) {
+        messenger.showSnackBar(
+          SnackBar(content: Text('Failed to delete alert: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _confirmClearAllAlerts(BuildContext context) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final shouldClear = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear All Alerts'),
+        content: const Text('Are you sure you want to delete ALL alert notifications? This cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete All', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldClear == true) {
+      try {
+        final snap = await FirebaseFirestore.instance.collection('patient_events').get();
+        final batch = FirebaseFirestore.instance.batch();
+        for (final doc in snap.docs) {
+          batch.delete(doc.reference);
+        }
+        await batch.commit();
+        messenger.showSnackBar(
+          const SnackBar(content: Text('All alerts deleted successfully.')),
+        );
+      } catch (e) {
+        messenger.showSnackBar(
+          SnackBar(content: Text('Failed to clear alerts: $e')),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isLoadingStaff) {
@@ -96,20 +171,28 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
     return Column(
       children: [
         Container(
-          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
           color: Colors.grey.shade200,
-          child: const Row(
+          child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text('Live Alert Feed',
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-              Row(
+              const Row(
                 children: [
-                  Icon(Icons.circle, color: Colors.green, size: 12),
-                  SizedBox(width: 4),
-                  Text('Connected', style: TextStyle(fontSize: 12)),
+                  Icon(Icons.circle, color: Colors.green, size: 10),
+                  SizedBox(width: 6),
+                  Text('Live Alert Feed',
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
                 ],
-              )
+              ),
+              TextButton.icon(
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.red,
+                  visualDensity: VisualDensity.compact,
+                ),
+                icon: const Icon(Icons.delete_sweep, size: 18),
+                label: const Text('Clear All', style: TextStyle(fontWeight: FontWeight.bold)),
+                onPressed: () => _confirmClearAllAlerts(context),
+              ),
             ],
           ),
         ),
@@ -177,7 +260,18 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
                       title: Text(title,
                           style: const TextStyle(fontWeight: FontWeight.bold)),
                       subtitle: Text(type.replaceAll('_', ' ').toUpperCase()),
-                      trailing: Text(timeStr),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(timeStr, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          const SizedBox(width: 4),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline, color: Colors.red, size: 22),
+                            tooltip: 'Delete Alert',
+                            onPressed: () => _confirmDeleteAlert(context, events[index].reference),
+                          ),
+                        ],
+                      ),
                       onTap: () {
                         if (patient != null) {
                           Navigator.push(
