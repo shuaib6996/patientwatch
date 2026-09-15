@@ -38,7 +38,7 @@ class _LiveCameraViewState extends State<LiveCameraView> {
     try {
       final token = await _authService.getCurrentUser()?.getIdToken() ?? 'valid-token';
       // IP is hardcoded for emulator accessing host. In production, use saved IP.
-      final url = Uri.parse('http://10.0.2.2:8000/cameras/${widget.patient.deviceId}/stream?token=$token');
+      final url = Uri.parse('http://10.138.52.217:8000/cameras/${widget.patient.deviceId}/stream?token=$token');
       
       final request = http.Request('GET', url);
       final response = await http.Client().send(request);
