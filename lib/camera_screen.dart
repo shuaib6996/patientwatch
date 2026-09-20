@@ -1,8 +1,8 @@
 import 'dart:convert';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
-import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
+import 'models/pose.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 import 'dart:async';
@@ -32,7 +32,8 @@ class CameraScreen extends StatefulWidget {
 class _CameraScreenState extends State<CameraScreen> {
   WebSocketChannel? _channel;
   Uint8List? _currentFrame;
-  String _serverIp = '10.138.52.217'; // Hotspot "On the spot" IP
+  String _serverIp = '100.97.64.92'; // Laptop Tailscale IP (Permanent & Global)
+  Timer? _heartbeatTimer;
 
   final FallDetectionLogic _fallDetectionLogic = FallDetectionLogic();
   final GestureDetectionLogic _gestureDetectionLogic = GestureDetectionLogic();
@@ -53,12 +54,13 @@ class _CameraScreenState extends State<CameraScreen> {
   CameraMode _cameraMode = CameraMode.viewBackend;
   CameraController? _phoneCameraController;
   bool _isStreamingPhone = false;
-  bool _isCapturingFrame = false;
   Timer? _phoneStreamTimer;
   final String _phoneCameraId = 'mobile_1';
   final http.Client _httpClient = http.Client();
   List<CameraDescription> _availableCameras = [];
   int _selectedCameraIndex = 0;
+
+
 
   bool get _isFrontCamera {
     if (_availableCameras.isEmpty || _selectedCameraIndex >= _availableCameras.length) {
@@ -82,7 +84,35 @@ class _CameraScreenState extends State<CameraScreen> {
     }
     _baselineService.startCalibration();
     _updateStatusUI();
+    _startHeartbeat();
     _connectWebSocket();
+  }
+
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _sendHeartbeat();
+    _heartbeatTimer = Timer.periodic(const Duration(seconds: 4), (_) => _sendHeartbeat());
+  }
+
+  Future<void> _sendHeartbeat() async {
+    try {
+      final url = Uri.parse('http://$_serverIp:8000/devices/heartbeat');
+      await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'device_id': _phoneCameraId,
+          'name': widget.patient.name.isNotEmpty
+              ? 'Phone - ${widget.patient.name}'
+              : 'Android Phone',
+          'type': 'mobile_app',
+        }),
+      ).timeout(const Duration(seconds: 3));
+      // Also send websocket keepalive ping
+      _channel?.sink.add(jsonEncode({'heartbeat': _phoneCameraId}));
+    } catch (e) {
+      // Backend may be starting or offline
+    }
   }
 
   void _sendWsSubscribe(String cameraId) {
@@ -103,6 +133,8 @@ class _CameraScreenState extends State<CameraScreen> {
       _sendWsSubscribe(_cameraMode == CameraMode.streamPhone ? _phoneCameraId : 'laptop_0');
       _channel!.stream.listen((message) {
         if (!mounted) return;
+        // In phone camera mode, ignore backend frames (we process locally)
+        if (_cameraMode == CameraMode.streamPhone) return;
         try {
           final data = jsonDecode(message);
           
@@ -279,7 +311,7 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   // ============================================================
-  // Phone Camera Streaming & Flip
+  // Phone Camera Streaming & On-Device Pose Detection
   // ============================================================
 
   Future<void> _startPhoneCamera() async {
@@ -299,9 +331,6 @@ class _CameraScreenState extends State<CameraScreen> {
       _currentStatusMessage = 'Starting phone camera...';
       _currentStatusColor = Colors.orange.withValues(alpha: 0.8);
     });
-
-    // Subscribe WebSocket to mobile_1 stream so we receive processed MediaPipe frames!
-    _sendWsSubscribe(_phoneCameraId);
 
     // Initialize with currently selected camera
     if (_selectedCameraIndex >= _availableCameras.length) {
@@ -328,10 +357,9 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _initPhoneCamera(CameraDescription camera) async {
-    // 1. Pause existing stream timer
+    // 1. Stop any previous image stream
     _phoneStreamTimer?.cancel();
     _phoneStreamTimer = null;
-    _isCapturingFrame = false;
 
     // 2. Dispose existing controller
     if (_phoneCameraController != null) {
@@ -347,9 +375,9 @@ class _CameraScreenState extends State<CameraScreen> {
 
     final controller = CameraController(
       camera,
-      ResolutionPreset.high, // Crystal-clear 720p HD resolution
+      ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg,
+      imageFormatGroup: ImageFormatGroup.nv21,
     );
 
     try {
@@ -362,11 +390,12 @@ class _CameraScreenState extends State<CameraScreen> {
       setState(() {
         _phoneCameraController = controller;
         _isStreamingPhone = true;
-        _currentStatusMessage = '📱 ${isFront ? "Front" : "Back"} Camera Active (MediaPipe)';
+        _currentStatusMessage = '📱 ${isFront ? "Front" : "Back"} Camera (Live Stream)';
         _currentStatusColor = Colors.teal.withValues(alpha: 0.9);
       });
 
-      _startFrameCapture();
+      // Start streaming frames to backend (lightweight & lag-free)
+      _startPhoneStream(camera);
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -378,45 +407,70 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  void _startFrameCapture() {
-    _phoneStreamTimer?.cancel();
-    // 250ms = 4 FPS — relaxed capture, zero shutter freeze on camera preview
-    _phoneStreamTimer = Timer.periodic(const Duration(milliseconds: 250), (_) async {
-      if (!_isStreamingPhone || _phoneCameraController == null || !_phoneCameraController!.value.isInitialized) {
-        return;
-      }
-      if (_isCapturingFrame) return; // Prevent concurrent takePicture calls
-      _isCapturingFrame = true;
+  void _startPhoneStream(CameraDescription camera) {
+    if (_phoneCameraController == null || !_phoneCameraController!.value.isInitialized) return;
 
-      try {
-        final XFile photo = await _phoneCameraController!.takePicture();
-        final bytes = await photo.readAsBytes();
-
-        final isFront = _isFrontCamera;
-        final sensorOrientation = _availableCameras.isNotEmpty && _selectedCameraIndex < _availableCameras.length
-            ? _availableCameras[_selectedCameraIndex].sensorOrientation
-            : 90;
-
-        final url = Uri.parse(
-            'http://$_serverIp:8000/cameras/mobile/frame?camera_id=$_phoneCameraId&sensor_orientation=$sensorOrientation&is_front=$isFront');
-        await _httpClient.post(
-          url,
-          body: bytes,
-          headers: {'Content-Type': 'application/octet-stream'},
-        );
-      } catch (e) {
-        // Silently continue - frame drops are expected
-      } finally {
-        _isCapturingFrame = false;
-      }
+    _phoneCameraController!.startImageStream((CameraImage image) {
+      if (!_isStreamingPhone || !mounted) return;
+      _streamFrameToBackend(image, camera);
     });
+  }
+
+  bool _isUploadingFrame = false;
+  int _lastFrameUploadTime = 0;
+
+  void _streamFrameToBackend(CameraImage image, CameraDescription camera) async {
+    if (_isUploadingFrame || !_isStreamingPhone) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastFrameUploadTime < 100) return; // Cap at ~10 FPS for network efficiency
+
+    _isUploadingFrame = true;
+    _lastFrameUploadTime = now;
+
+    try {
+      Uint8List bytes;
+      if (image.planes.length == 1) {
+        bytes = image.planes[0].bytes;
+      } else {
+        final WriteBuffer allBytes = WriteBuffer();
+        for (final Plane plane in image.planes) {
+          allBytes.putUint8List(plane.bytes);
+        }
+        bytes = allBytes.done().buffer.asUint8List();
+      }
+
+      final isFront = camera.lensDirection == CameraLensDirection.front;
+      final uri = Uri.parse(
+        'http://$_serverIp:8000/cameras/mobile/frame?'
+        'camera_id=$_phoneCameraId&'
+        'sensor_orientation=${camera.sensorOrientation}&'
+        'is_front=$isFront&'
+        'width=${image.width}&'
+        'height=${image.height}&'
+        'format=nv21',
+      );
+
+      await http.post(
+        uri,
+        headers: {'Content-Type': 'application/octet-stream'},
+        body: bytes,
+      ).timeout(const Duration(milliseconds: 1500));
+    } catch (_) {
+      // Discard dropped network frame
+    } finally {
+      _isUploadingFrame = false;
+    }
   }
 
   void _stopPhoneCamera() {
     _phoneStreamTimer?.cancel();
     _phoneStreamTimer = null;
     _isStreamingPhone = false;
-    _isCapturingFrame = false;
+
+    // Stop the image stream before disposing
+    try {
+      _phoneCameraController?.stopImageStream();
+    } catch (_) {}
     _phoneCameraController?.dispose();
     _phoneCameraController = null;
 
@@ -433,7 +487,11 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
+    _heartbeatTimer?.cancel();
     _phoneStreamTimer?.cancel();
+    try {
+      _phoneCameraController?.stopImageStream();
+    } catch (_) {}
     _phoneCameraController?.dispose();
     _httpClient.close();
     _channel?.sink.close();
@@ -455,7 +513,7 @@ class _CameraScreenState extends State<CameraScreen> {
                 decoration: const InputDecoration(labelText: "IP Address"),
               ),
               const SizedBox(height: 8),
-              const Text("10.0.2.2 = Android Emulator\n127.0.0.1 = Windows Desktop\n192.168.x.x = Real Phone on WiFi", style: TextStyle(fontSize: 12, color: Colors.grey)),
+              const Text("Tailscale IP: 100.97.64.92\nWi-Fi IP: 10.161.120.217\n10.0.2.2 = Emulator", style: TextStyle(fontSize: 12, color: Colors.grey)),
             ],
           ),
           actions: [
@@ -466,9 +524,10 @@ class _CameraScreenState extends State<CameraScreen> {
             ElevatedButton(
               onPressed: () {
                 setState(() {
-                  _serverIp = ipController.text;
+                  _serverIp = ipController.text.trim();
                 });
                 Navigator.pop(context);
+                _startHeartbeat();
                 _connectWebSocket();
               },
               child: const Text("Connect"),
@@ -545,7 +604,7 @@ class _CameraScreenState extends State<CameraScreen> {
                   return Stack(
                     fit: StackFit.expand,
                     children: [
-                      // Centered & fitted HD CameraPreview without skeleton overlay
+                      // Centered & fitted HD CameraPreview
                       Positioned(
                         left: dx,
                         top: dy,

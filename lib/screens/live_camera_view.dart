@@ -37,8 +37,8 @@ class _LiveCameraViewState extends State<LiveCameraView> {
   Future<void> _startMjpegStream() async {
     try {
       final token = await _authService.getCurrentUser()?.getIdToken() ?? 'valid-token';
-      // IP is hardcoded for emulator accessing host. In production, use saved IP.
-      final url = Uri.parse('http://10.138.52.217:8000/cameras/${widget.patient.deviceId}/stream?token=$token');
+      // IP is set to Laptop Tailscale IP (Permanent & Global)
+      final url = Uri.parse('http://100.97.64.92:8000/cameras/${widget.patient.deviceId}/stream?token=$token');
       
       final request = http.Request('GET', url);
       final response = await http.Client().send(request);

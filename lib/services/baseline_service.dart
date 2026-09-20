@@ -1,5 +1,5 @@
 import 'package:flutter/foundation.dart';
-import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
+import '../models/pose.dart';
 
 class BaselineService {
   // Configurable thresholds for baseline

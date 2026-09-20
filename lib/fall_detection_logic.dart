@@ -1,4 +1,4 @@
-import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
+import 'models/pose.dart';
 
 class FallDetectionLogic {
   /// CONFIGURABLE THRESHOLDS for Fall Detection

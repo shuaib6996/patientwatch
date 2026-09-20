@@ -1,4 +1,4 @@
-import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
+import '../models/pose.dart';
 import 'baseline_service.dart';
 
 class StillnessDetector {
