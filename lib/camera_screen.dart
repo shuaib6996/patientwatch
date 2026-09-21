@@ -7,7 +7,6 @@ import 'models/pose.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 import 'dart:async';
-import 'package:image/image.dart' as img;
 import 'fall_detection_logic.dart';
 import 'gesture_detection_logic.dart';
 import 'firebase_service.dart';
@@ -384,7 +383,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
     final controller = CameraController(
       camera,
-      ResolutionPreset.medium,
+      ResolutionPreset.low, // 320x240 — lightweight for streaming (fast NV21, small data)
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.nv21,
     );
@@ -428,47 +427,6 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _isUploadingFrame = false;
   int _lastFrameUploadTime = 0;
 
-  /// Compress NV21 camera image to JPEG on-device (runs in isolate for zero UI jank)
-  static Uint8List? _compressFrameInIsolate(Map<String, dynamic> params) {
-    try {
-      final Uint8List nv21Bytes = params['bytes'];
-      final int width = params['width'];
-      final int height = params['height'];
-      final int quality = params['quality'];
-
-      // Convert NV21 to Image using the image package
-      final img.Image image = img.Image(width: width, height: height);
-
-      // NV21 format: Y plane followed by interleaved VU
-      final int ySize = width * height;
-      for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-          final int yIndex = y * width + x;
-          final int uvIndex = ySize + (y ~/ 2) * width + (x & ~1);
-
-          if (yIndex >= nv21Bytes.length || uvIndex + 1 >= nv21Bytes.length) continue;
-
-          final int yVal = nv21Bytes[yIndex] & 0xFF;
-          final int vVal = nv21Bytes[uvIndex] & 0xFF;
-          final int uVal = nv21Bytes[uvIndex + 1] & 0xFF;
-
-          // YUV to RGB conversion
-          int r = (yVal + 1.370705 * (vVal - 128)).round().clamp(0, 255);
-          int g = (yVal - 0.337633 * (uVal - 128) - 0.698001 * (vVal - 128)).round().clamp(0, 255);
-          int b = (yVal + 1.732446 * (uVal - 128)).round().clamp(0, 255);
-
-          image.setPixelRgba(x, y, r, g, b, 255);
-        }
-      }
-
-      // Encode to JPEG with specified quality
-      final jpegBytes = img.encodeJpg(image, quality: quality);
-      return Uint8List.fromList(jpegBytes);
-    } catch (e) {
-      return null;
-    }
-  }
-
   void _streamFrameToBackend(CameraImage image, CameraDescription camera) async {
     if (_isUploadingFrame || !_isStreamingPhone) return;
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -479,32 +437,17 @@ class _CameraScreenState extends State<CameraScreen> {
     _lastFrameUploadTime = now;
 
     try {
-      // Collect raw NV21 bytes
-      Uint8List rawBytes;
+      // Collect raw NV21 bytes — at low res (320x240) this is only ~115KB
+      // No Dart-side compression needed; backend OpenCV handles NV21→BGR natively (near-instant C code)
+      Uint8List bytes;
       if (image.planes.length == 1) {
-        rawBytes = Uint8List.fromList(image.planes[0].bytes);
+        bytes = image.planes[0].bytes;
       } else {
         final WriteBuffer allBytes = WriteBuffer();
         for (final Plane plane in image.planes) {
           allBytes.putUint8List(plane.bytes);
         }
-        rawBytes = allBytes.done().buffer.asUint8List();
-      }
-
-      // JPEG quality: lower when network is slow (adaptive)
-      final int jpegQuality = _avgLatencyMs > 300 ? 40 : (_avgLatencyMs > 150 ? 55 : 70);
-
-      // Compress to JPEG in a background isolate (non-blocking)
-      final Uint8List? jpegBytes = await compute(_compressFrameInIsolate, {
-        'bytes': rawBytes,
-        'width': image.width,
-        'height': image.height,
-        'quality': jpegQuality,
-      });
-
-      if (jpegBytes == null || !_isStreamingPhone) {
-        _isUploadingFrame = false;
-        return;
+        bytes = allBytes.done().buffer.asUint8List();
       }
 
       final isFront = camera.lensDirection == CameraLensDirection.front;
@@ -515,14 +458,14 @@ class _CameraScreenState extends State<CameraScreen> {
         'is_front=$isFront&'
         'width=${image.width}&'
         'height=${image.height}&'
-        'format=jpeg',
+        'format=nv21',
       );
 
       final stopwatch = Stopwatch()..start();
       await _httpClient.post(
         uri,
         headers: {'Content-Type': 'application/octet-stream'},
-        body: jpegBytes,
+        body: bytes,
       ).timeout(const Duration(milliseconds: 2000));
       stopwatch.stop();
 
