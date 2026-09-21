@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
@@ -6,6 +7,7 @@ import 'models/pose.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 import 'dart:async';
+import 'package:image/image.dart' as img;
 import 'fall_detection_logic.dart';
 import 'gesture_detection_logic.dart';
 import 'firebase_service.dart';
@@ -60,6 +62,13 @@ class _CameraScreenState extends State<CameraScreen> {
   List<CameraDescription> _availableCameras = [];
   int _selectedCameraIndex = 0;
 
+  // === Tailscale Lag Optimization ===
+  int _adaptiveFpsMs = 100;        // Start at ~10 FPS, auto-adjust
+  int _consecutiveSlowFrames = 0;  // Track slow network responses
+  int _consecutiveFastFrames = 0;  // Track fast network responses
+  double _avgLatencyMs = 0;        // Running average latency
+  int _framesSent = 0;
+  int _framesDropped = 0;
 
 
   bool get _isFrontCamera {
@@ -419,24 +428,83 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _isUploadingFrame = false;
   int _lastFrameUploadTime = 0;
 
+  /// Compress NV21 camera image to JPEG on-device (runs in isolate for zero UI jank)
+  static Uint8List? _compressFrameInIsolate(Map<String, dynamic> params) {
+    try {
+      final Uint8List nv21Bytes = params['bytes'];
+      final int width = params['width'];
+      final int height = params['height'];
+      final int quality = params['quality'];
+
+      // Convert NV21 to Image using the image package
+      final img.Image image = img.Image(width: width, height: height);
+
+      // NV21 format: Y plane followed by interleaved VU
+      final int ySize = width * height;
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final int yIndex = y * width + x;
+          final int uvIndex = ySize + (y ~/ 2) * width + (x & ~1);
+
+          if (yIndex >= nv21Bytes.length || uvIndex + 1 >= nv21Bytes.length) continue;
+
+          final int yVal = nv21Bytes[yIndex] & 0xFF;
+          final int vVal = nv21Bytes[uvIndex] & 0xFF;
+          final int uVal = nv21Bytes[uvIndex + 1] & 0xFF;
+
+          // YUV to RGB conversion
+          int r = (yVal + 1.370705 * (vVal - 128)).round().clamp(0, 255);
+          int g = (yVal - 0.337633 * (uVal - 128) - 0.698001 * (vVal - 128)).round().clamp(0, 255);
+          int b = (yVal + 1.732446 * (uVal - 128)).round().clamp(0, 255);
+
+          image.setPixelRgba(x, y, r, g, b, 255);
+        }
+      }
+
+      // Encode to JPEG with specified quality
+      final jpegBytes = img.encodeJpg(image, quality: quality);
+      return Uint8List.fromList(jpegBytes);
+    } catch (e) {
+      return null;
+    }
+  }
+
   void _streamFrameToBackend(CameraImage image, CameraDescription camera) async {
     if (_isUploadingFrame || !_isStreamingPhone) return;
     final now = DateTime.now().millisecondsSinceEpoch;
-    if (now - _lastFrameUploadTime < 100) return; // Cap at ~10 FPS for network efficiency
+    // Use adaptive FPS interval instead of fixed 100ms
+    if (now - _lastFrameUploadTime < _adaptiveFpsMs) return;
 
     _isUploadingFrame = true;
     _lastFrameUploadTime = now;
 
     try {
-      Uint8List bytes;
+      // Collect raw NV21 bytes
+      Uint8List rawBytes;
       if (image.planes.length == 1) {
-        bytes = image.planes[0].bytes;
+        rawBytes = Uint8List.fromList(image.planes[0].bytes);
       } else {
         final WriteBuffer allBytes = WriteBuffer();
         for (final Plane plane in image.planes) {
           allBytes.putUint8List(plane.bytes);
         }
-        bytes = allBytes.done().buffer.asUint8List();
+        rawBytes = allBytes.done().buffer.asUint8List();
+      }
+
+      // JPEG quality: lower when network is slow (adaptive)
+      final int jpegQuality = _avgLatencyMs > 300 ? 40 : (_avgLatencyMs > 150 ? 55 : 70);
+
+      // Compress to JPEG in a background isolate (non-blocking)
+      final Uint8List? jpegBytes = await compute(_compressFrameInIsolate, {
+        'bytes': rawBytes,
+        'width': image.width,
+        'height': image.height,
+        'quality': jpegQuality,
+      });
+
+      if (jpegBytes == null || !_isStreamingPhone) {
+        _isUploadingFrame = false;
+        return;
       }
 
       final isFront = camera.lensDirection == CameraLensDirection.front;
@@ -447,16 +515,50 @@ class _CameraScreenState extends State<CameraScreen> {
         'is_front=$isFront&'
         'width=${image.width}&'
         'height=${image.height}&'
-        'format=nv21',
+        'format=jpeg',
       );
 
-      await http.post(
+      final stopwatch = Stopwatch()..start();
+      await _httpClient.post(
         uri,
         headers: {'Content-Type': 'application/octet-stream'},
-        body: bytes,
-      ).timeout(const Duration(milliseconds: 1500));
+        body: jpegBytes,
+      ).timeout(const Duration(milliseconds: 2000));
+      stopwatch.stop();
+
+      _framesSent++;
+
+      // === Adaptive FPS Logic ===
+      final latency = stopwatch.elapsedMilliseconds.toDouble();
+      _avgLatencyMs = _avgLatencyMs == 0 ? latency : (_avgLatencyMs * 0.7 + latency * 0.3);
+
+      if (latency > 400) {
+        // Network is slow → reduce FPS
+        _consecutiveSlowFrames++;
+        _consecutiveFastFrames = 0;
+        if (_consecutiveSlowFrames >= 3 && _adaptiveFpsMs < 500) {
+          _adaptiveFpsMs = (_adaptiveFpsMs * 1.5).round().clamp(100, 500);
+          debugPrint('[AdaptiveFPS] Slowing to ${(1000 / _adaptiveFpsMs).toStringAsFixed(1)} FPS (latency: ${latency.round()}ms)');
+        }
+      } else if (latency < 150) {
+        // Network is fast → increase FPS
+        _consecutiveFastFrames++;
+        _consecutiveSlowFrames = 0;
+        if (_consecutiveFastFrames >= 5 && _adaptiveFpsMs > 100) {
+          _adaptiveFpsMs = (_adaptiveFpsMs * 0.8).round().clamp(80, 500);
+          debugPrint('[AdaptiveFPS] Speeding to ${(1000 / _adaptiveFpsMs).toStringAsFixed(1)} FPS (latency: ${latency.round()}ms)');
+        }
+      } else {
+        _consecutiveSlowFrames = 0;
+        _consecutiveFastFrames = 0;
+      }
     } catch (_) {
-      // Discard dropped network frame
+      _framesDropped++;
+      // Timeout or network error → aggressively reduce FPS
+      if (_adaptiveFpsMs < 400) {
+        _adaptiveFpsMs = (_adaptiveFpsMs * 1.8).round().clamp(100, 500);
+        debugPrint('[AdaptiveFPS] Network timeout, reducing to ${(1000 / _adaptiveFpsMs).toStringAsFixed(1)} FPS');
+      }
     } finally {
       _isUploadingFrame = false;
     }
@@ -466,6 +568,14 @@ class _CameraScreenState extends State<CameraScreen> {
     _phoneStreamTimer?.cancel();
     _phoneStreamTimer = null;
     _isStreamingPhone = false;
+
+    // Reset adaptive state for next session
+    _adaptiveFpsMs = 100;
+    _consecutiveSlowFrames = 0;
+    _consecutiveFastFrames = 0;
+    _avgLatencyMs = 0;
+    _framesSent = 0;
+    _framesDropped = 0;
 
     // Stop the image stream before disposing
     try {
