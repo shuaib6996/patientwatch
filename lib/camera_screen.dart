@@ -1,7 +1,7 @@
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'models/pose.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -35,6 +35,8 @@ class _CameraScreenState extends State<CameraScreen> {
   Uint8List? _currentFrame;
   String _serverIp = '100.97.64.92'; // Laptop Tailscale IP (Permanent & Global)
   Timer? _heartbeatTimer;
+  Timer? _reconnectTimer;
+  bool _isDisposed = false;
 
   final FallDetectionLogic _fallDetectionLogic = FallDetectionLogic();
   final GestureDetectionLogic _gestureDetectionLogic = GestureDetectionLogic();
@@ -55,19 +57,15 @@ class _CameraScreenState extends State<CameraScreen> {
   CameraMode _cameraMode = CameraMode.viewBackend;
   CameraController? _phoneCameraController;
   bool _isStreamingPhone = false;
-  Timer? _phoneStreamTimer;
   final String _phoneCameraId = 'mobile_1';
   final http.Client _httpClient = http.Client();
   List<CameraDescription> _availableCameras = [];
   int _selectedCameraIndex = 0;
 
-  // === Tailscale Lag Optimization ===
-  int _adaptiveFpsMs = 100;        // Start at ~10 FPS, auto-adjust
-  int _consecutiveSlowFrames = 0;  // Track slow network responses
-  int _consecutiveFastFrames = 0;  // Track fast network responses
-  double _avgLatencyMs = 0;        // Running average latency
-  int _framesSent = 0;
-  int _framesDropped = 0;
+  // Stream throttle & network flag
+  int _lastFrameSendTime = 0;
+  bool _isFramePending = false;
+  bool get _isTailscaleIp => _serverIp.startsWith('100.');
 
 
   bool get _isFrontCamera {
@@ -134,23 +132,66 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  void _scheduleReconnect() {
+    if (_isDisposed || !mounted) return;
+    if (_reconnectTimer != null && _reconnectTimer!.isActive) return;
+
+    _reconnectTimer = Timer(const Duration(seconds: 2), () {
+      if (_isDisposed || !mounted) return;
+      debugPrint("[WebSocket] Auto-reconnecting to backend ws://$_serverIp:8765...");
+      _connectWebSocket();
+    });
+  }
+
   void _connectWebSocket() {
-    _channel?.sink.close(); // Close existing if any
+    if (_isDisposed) return;
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+
+    try {
+      _channel?.sink.close();
+    } catch (_) {}
+
     try {
       _channel = WebSocketChannel.connect(Uri.parse('ws://$_serverIp:8765'));
-      _sendWsSubscribe(_cameraMode == CameraMode.streamPhone ? _phoneCameraId : 'laptop_0');
+
+      // In phone camera mode, subscribe to 'none' so no video loopback floods the phone
+      _sendWsSubscribe(_cameraMode == CameraMode.streamPhone ? 'none' : 'laptop_0');
+
       _channel!.stream.listen((message) {
-        if (!mounted) return;
-        // In phone camera mode, ignore backend frames (we process locally)
-        if (_cameraMode == CameraMode.streamPhone) return;
+        if (!mounted || _isDisposed) return;
+
+        // Cancel any pending reconnect on active connection
+        _reconnectTimer?.cancel();
+        _reconnectTimer = null;
+
         try {
+          if (message is! String) return;
           final data = jsonDecode(message);
           
-          // Handle subscription events
-          if (data['event'] != null) {
-            debugPrint("WS Event: ${data['event']} - ${data['camera_id'] ?? data['message'] ?? ''}");
+          // 1. Two-Way Realtime Camera Synchronization with Dashboard
+          final event = data['event'];
+          if (event == 'camera_switched' || event == 'initial_state') {
+            final targetCam = (data['camera_id'] ?? data['active_camera_id']) as String?;
+            if (targetCam != null) {
+              debugPrint("[CameraSync] Syncing camera state: $targetCam");
+              if (targetCam.startsWith('mobile') && _cameraMode != CameraMode.streamPhone) {
+                _startPhoneCamera();
+              } else if (!targetCam.startsWith('mobile') && _cameraMode == CameraMode.streamPhone) {
+                _stopPhoneCamera();
+              }
+            }
             return;
           }
+          
+          // Handle subscription & waiting events
+          if (event != null) {
+            debugPrint("WS Event: $event - ${data['camera_id'] ?? data['message'] ?? ''}");
+            return;
+          }
+
+          // In phone camera mode, ignore backend frames
+          if (_cameraMode == CameraMode.streamPhone) return;
 
           final base64Image = data['frame'] as String;
           final imageBytes = base64Decode(base64Image);
@@ -176,25 +217,31 @@ class _CameraScreenState extends State<CameraScreen> {
         }
       }, onError: (e) {
         debugPrint("WebSocket Error: $e");
-        if (mounted) {
+        if (mounted && !_isDisposed) {
           setState(() {
-            _currentStatusMessage = 'Backend Disconnected. Run main.py';
-            _currentStatusColor = Colors.red;
+            _currentStatusMessage = 'Reconnecting to backend...';
+            _currentStatusColor = Colors.orange;
           });
+          _scheduleReconnect();
         }
       }, onDone: () {
-        if (mounted) {
+        debugPrint("WebSocket stream closed.");
+        if (mounted && !_isDisposed) {
           setState(() {
-            _currentStatusMessage = 'Backend Disconnected.';
-            _currentStatusColor = Colors.red;
+            _currentStatusMessage = 'Reconnecting to backend...';
+            _currentStatusColor = Colors.orange;
           });
+          _scheduleReconnect();
         }
       });
     } catch (e) {
-      setState(() {
-        _currentStatusMessage = 'Failed to connect. Run python backend.';
-        _currentStatusColor = Colors.red;
-      });
+      if (mounted && !_isDisposed) {
+        setState(() {
+          _currentStatusMessage = 'Connecting to backend...';
+          _currentStatusColor = Colors.orange;
+        });
+        _scheduleReconnect();
+      }
     }
   }
 
@@ -347,6 +394,55 @@ class _CameraScreenState extends State<CameraScreen> {
     await _initPhoneCamera(_availableCameras[_selectedCameraIndex]);
   }
 
+  static const MethodChannel _compressorChannel =
+      MethodChannel('com.example.patient_watch/image_compressor');
+
+  /// High-speed native hardware YUV to JPEG compression via Android's libjpeg
+  Future<Uint8List?> _compressCameraImageToJpeg(CameraImage image, {int quality = 70}) async {
+    try {
+      if (image.planes.isEmpty) return null;
+
+      final int width = image.width;
+      final int height = image.height;
+
+      if (image.planes.length == 1) {
+        // Single NV21 contiguous plane
+        final dynamic result = await _compressorChannel.invokeMethod('compressYuvToJpeg', {
+          'y': image.planes[0].bytes,
+          'width': width,
+          'height': height,
+          'quality': quality,
+        });
+        if (result is Uint8List) return result;
+        if (result is List<int>) return Uint8List.fromList(result);
+        return null;
+      } else if (image.planes.length >= 3) {
+        // 3 planes YUV_420_888
+        final yPlane = image.planes[0];
+        final uPlane = image.planes[1];
+        final vPlane = image.planes[2];
+
+        final dynamic result = await _compressorChannel.invokeMethod('compressYuvToJpeg', {
+          'y': yPlane.bytes,
+          'u': uPlane.bytes,
+          'v': vPlane.bytes,
+          'width': width,
+          'height': height,
+          'yRowStride': yPlane.bytesPerRow,
+          'uvRowStride': uPlane.bytesPerRow,
+          'uvPixelStride': uPlane.bytesPerPixel ?? 2,
+          'quality': quality,
+        });
+        if (result is Uint8List) return result;
+        if (result is List<int>) return Uint8List.fromList(result);
+        return null;
+      }
+    } catch (e) {
+      debugPrint("[Compressor] Native compression error: $e");
+    }
+    return null;
+  }
+
   Future<void> _flipCamera() async {
     if (_availableCameras.length < 2) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -354,6 +450,14 @@ class _CameraScreenState extends State<CameraScreen> {
       );
       return;
     }
+
+    try {
+      _phoneCameraController?.stopImageStream();
+    } catch (_) {}
+    try {
+      _phoneCameraController?.dispose();
+    } catch (_) {}
+    _phoneCameraController = null;
 
     final newIndex = (_selectedCameraIndex + 1) % _availableCameras.length;
     setState(() {
@@ -365,13 +469,14 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _initPhoneCamera(CameraDescription camera) async {
-    // 1. Stop any previous image stream
-    _phoneStreamTimer?.cancel();
-    _phoneStreamTimer = null;
-
-    // 2. Dispose existing controller
+    // 1. Dispose existing controller safely
     if (_phoneCameraController != null) {
-      await _phoneCameraController!.dispose();
+      try {
+        await _phoneCameraController!.stopImageStream();
+      } catch (_) {}
+      try {
+        await _phoneCameraController!.dispose();
+      } catch (_) {}
       _phoneCameraController = null;
     }
 
@@ -383,14 +488,14 @@ class _CameraScreenState extends State<CameraScreen> {
 
     final controller = CameraController(
       camera,
-      ResolutionPreset.low, // 320x240 — lightweight for streaming (fast NV21, small data)
+      ResolutionPreset.medium, // 640x480 — Crystal-clear, high quality monitoring!
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.nv21,
     );
 
     try {
       await controller.initialize();
-      if (!mounted) {
+      if (!mounted || _isDisposed) {
         controller.dispose();
         return;
       }
@@ -402,10 +507,14 @@ class _CameraScreenState extends State<CameraScreen> {
         _currentStatusColor = Colors.teal.withValues(alpha: 0.9);
       });
 
-      // Start streaming frames to backend (lightweight & lag-free)
+      // Notify backend + dashboard about camera switch
+      _notifyCameraSwitch('mobile_1');
+      _sendWsSubscribe('none');
+
+      // Start hardware-accelerated startImageStream (zero camera freeze, zero lag!)
       _startPhoneStream(camera);
     } catch (e) {
-      if (mounted) {
+      if (mounted && !_isDisposed) {
         setState(() {
           _currentStatusMessage = 'Camera init failed: $e';
           _currentStatusColor = Colors.red;
@@ -415,116 +524,92 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  /// Notify backend & dashboard about camera source change (syncs both sides)
+  Future<void> _notifyCameraSwitch(String cameraId) async {
+    try {
+      // 1. Send over WebSocket for instant real-time sync across all clients
+      _channel?.sink.add(jsonEncode({
+        'command': 'switch_camera',
+        'camera_id': cameraId,
+        'subscribe': cameraId == 'mobile_1' ? 'none' : cameraId,
+      }));
+      // 2. HTTP POST notification to backend
+      _httpClient.post(
+        Uri.parse('http://$_serverIp:8000/cameras/notify_switch'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'camera_id': cameraId}),
+      ).catchError((_) => http.Response('', 500));
+    } catch (_) {}
+  }
+
+  /// Hardware-accelerated startImageStream streaming 25-35 KB crisp JPEG packets over WebSocket
   void _startPhoneStream(CameraDescription camera) {
     if (_phoneCameraController == null || !_phoneCameraController!.value.isInitialized) return;
 
-    _phoneCameraController!.startImageStream((CameraImage image) {
-      if (!_isStreamingPhone || !mounted) return;
-      _streamFrameToBackend(image, camera);
+    // Adaptive frame interval: Tailscale: ~9-10 FPS (110ms), WiFi: ~15 FPS (65ms)
+    final int intervalMs = _isTailscaleIp ? 110 : 65;
+
+    _phoneCameraController!.startImageStream((CameraImage image) async {
+      if (!_isStreamingPhone || !mounted || _isDisposed) return;
+
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (now - _lastFrameSendTime < intervalMs || _isFramePending) return;
+      _lastFrameSendTime = now;
+      _isFramePending = true;
+
+      try {
+        final Uint8List? jpegBytes = await _compressCameraImageToJpeg(image, quality: 70);
+        if (jpegBytes == null || !_isStreamingPhone || !mounted || _isDisposed) return;
+
+        // 16-byte binary MOBF header
+        final header = ByteData(16);
+        header.setUint32(0, 0x4D4F4246); // 'MOBF'
+        header.setUint16(4, image.width);
+        header.setUint16(6, image.height);
+        header.setUint16(8, camera.sensorOrientation);
+        header.setUint8(10, _isFrontCamera ? 1 : 0);
+        header.setUint8(11, 1); // 1 = JPEG format
+        header.setUint32(12, now);
+
+        final packet = Uint8List(16 + jpegBytes.length);
+        packet.setRange(0, 16, header.buffer.asUint8List());
+        packet.setRange(16, packet.length, jpegBytes);
+
+        // Send directly over persistent WebSocket (zero HTTP overhead, instant!)
+        if (_channel != null) {
+          _channel!.sink.add(packet);
+        } else {
+          // Fallback to HTTP POST if WebSocket reconnecting
+          _httpClient.post(
+            Uri.parse('http://$_serverIp:8000/cameras/mobile/frame?'
+                'camera_id=$_phoneCameraId&'
+                'sensor_orientation=${camera.sensorOrientation}&'
+                'is_front=$_isFrontCamera&'
+                'width=${image.width}&'
+                'height=${image.height}&'
+                'format=jpeg'),
+            headers: {'Content-Type': 'application/octet-stream'},
+            body: jpegBytes,
+          ).catchError((_) => http.Response('', 500));
+        }
+      } catch (e) {
+        debugPrint("[PhoneStream Error] $e");
+      } finally {
+        _isFramePending = false;
+      }
     });
   }
 
-  bool _isUploadingFrame = false;
-  int _lastFrameUploadTime = 0;
-
-  void _streamFrameToBackend(CameraImage image, CameraDescription camera) async {
-    if (_isUploadingFrame || !_isStreamingPhone) return;
-    final now = DateTime.now().millisecondsSinceEpoch;
-    // Use adaptive FPS interval instead of fixed 100ms
-    if (now - _lastFrameUploadTime < _adaptiveFpsMs) return;
-
-    _isUploadingFrame = true;
-    _lastFrameUploadTime = now;
-
-    try {
-      // Collect raw NV21 bytes — at low res (320x240) this is only ~115KB
-      // No Dart-side compression needed; backend OpenCV handles NV21→BGR natively (near-instant C code)
-      Uint8List bytes;
-      if (image.planes.length == 1) {
-        bytes = image.planes[0].bytes;
-      } else {
-        final WriteBuffer allBytes = WriteBuffer();
-        for (final Plane plane in image.planes) {
-          allBytes.putUint8List(plane.bytes);
-        }
-        bytes = allBytes.done().buffer.asUint8List();
-      }
-
-      final isFront = camera.lensDirection == CameraLensDirection.front;
-      final uri = Uri.parse(
-        'http://$_serverIp:8000/cameras/mobile/frame?'
-        'camera_id=$_phoneCameraId&'
-        'sensor_orientation=${camera.sensorOrientation}&'
-        'is_front=$isFront&'
-        'width=${image.width}&'
-        'height=${image.height}&'
-        'format=nv21',
-      );
-
-      final stopwatch = Stopwatch()..start();
-      await _httpClient.post(
-        uri,
-        headers: {'Content-Type': 'application/octet-stream'},
-        body: bytes,
-      ).timeout(const Duration(milliseconds: 2000));
-      stopwatch.stop();
-
-      _framesSent++;
-
-      // === Adaptive FPS Logic ===
-      final latency = stopwatch.elapsedMilliseconds.toDouble();
-      _avgLatencyMs = _avgLatencyMs == 0 ? latency : (_avgLatencyMs * 0.7 + latency * 0.3);
-
-      if (latency > 400) {
-        // Network is slow → reduce FPS
-        _consecutiveSlowFrames++;
-        _consecutiveFastFrames = 0;
-        if (_consecutiveSlowFrames >= 3 && _adaptiveFpsMs < 500) {
-          _adaptiveFpsMs = (_adaptiveFpsMs * 1.5).round().clamp(100, 500);
-          debugPrint('[AdaptiveFPS] Slowing to ${(1000 / _adaptiveFpsMs).toStringAsFixed(1)} FPS (latency: ${latency.round()}ms)');
-        }
-      } else if (latency < 150) {
-        // Network is fast → increase FPS
-        _consecutiveFastFrames++;
-        _consecutiveSlowFrames = 0;
-        if (_consecutiveFastFrames >= 5 && _adaptiveFpsMs > 100) {
-          _adaptiveFpsMs = (_adaptiveFpsMs * 0.8).round().clamp(80, 500);
-          debugPrint('[AdaptiveFPS] Speeding to ${(1000 / _adaptiveFpsMs).toStringAsFixed(1)} FPS (latency: ${latency.round()}ms)');
-        }
-      } else {
-        _consecutiveSlowFrames = 0;
-        _consecutiveFastFrames = 0;
-      }
-    } catch (_) {
-      _framesDropped++;
-      // Timeout or network error → aggressively reduce FPS
-      if (_adaptiveFpsMs < 400) {
-        _adaptiveFpsMs = (_adaptiveFpsMs * 1.8).round().clamp(100, 500);
-        debugPrint('[AdaptiveFPS] Network timeout, reducing to ${(1000 / _adaptiveFpsMs).toStringAsFixed(1)} FPS');
-      }
-    } finally {
-      _isUploadingFrame = false;
-    }
-  }
-
   void _stopPhoneCamera() {
-    _phoneStreamTimer?.cancel();
-    _phoneStreamTimer = null;
     _isStreamingPhone = false;
+    _isFramePending = false;
 
-    // Reset adaptive state for next session
-    _adaptiveFpsMs = 100;
-    _consecutiveSlowFrames = 0;
-    _consecutiveFastFrames = 0;
-    _avgLatencyMs = 0;
-    _framesSent = 0;
-    _framesDropped = 0;
-
-    // Stop the image stream before disposing
     try {
       _phoneCameraController?.stopImageStream();
     } catch (_) {}
-    _phoneCameraController?.dispose();
+    try {
+      _phoneCameraController?.dispose();
+    } catch (_) {}
     _phoneCameraController = null;
 
     setState(() {
@@ -534,14 +619,16 @@ class _CameraScreenState extends State<CameraScreen> {
       _currentFrame = null;
     });
 
-    // Re-subscribe WebSocket to laptop webcam
+    // Notify backend + dashboard about switch back to laptop
+    _notifyCameraSwitch('laptop_0');
     _sendWsSubscribe('laptop_0');
   }
 
   @override
   void dispose() {
+    _isDisposed = true;
+    _reconnectTimer?.cancel();
     _heartbeatTimer?.cancel();
-    _phoneStreamTimer?.cancel();
     try {
       _phoneCameraController?.stopImageStream();
     } catch (_) {}
