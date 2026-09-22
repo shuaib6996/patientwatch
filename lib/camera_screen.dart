@@ -67,15 +67,20 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _isFramePending = false;
   bool get _isTailscaleIp => _serverIp.startsWith('100.');
 
-  // ACK-based flow control for Tailscale:
-  // Instead of a fixed timer (which causes queue buildup over high-RTT links),
-  // we track whether the server has acknowledged processing the last frame.
-  // On WiFi (RTT < 5ms), ACK arrives instantly → same throughput as before.
-  // On Tailscale (RTT 50-150ms), we wait for ACK before sending next frame →
-  // no queue buildup, always fresh frames, no lag.
-  bool _waitingForServerAck = false;
-  int _ackTimeoutMs = 0; // If ACK doesn't come within this window, force-unblock
-  static const int _tailscaleAckTimeoutMs = 400; // Tailscale: 400ms timeout
+  // Sliding Window flow control for Tailscale (TCP's own principle):
+  //
+  // Pure ACK-based (1 frame in-flight) limits throughput to 1/RTT:
+  //   RTT=150ms → 1/0.150 = ~6 FPS  ← too laggy
+  //
+  // Sliding window (N frames in-flight) gives N/RTT throughput:
+  //   N=2, RTT=150ms → 2/0.150 = ~13 FPS  ← smooth
+  //   N=2, RTT=50ms  → 2/0.050 = ~40 FPS  (capped at 15 FPS by WiFi timer)
+  //
+  // Server's max_queue=2 drops excess frames if processing is slow,
+  // so we never build up a stale backlog even with 2 in-flight.
+  static const int _tailscaleWindowSize = 2;  // frames in-flight simultaneously
+  static const int _tailscaleAckTimeoutMs = 500; // force-unblock if ACK lost
+  int _inFlightFrames = 0;  // frames sent but not yet ACK'd by server
 
 
   bool get _isFrontCamera {
@@ -182,9 +187,9 @@ class _CameraScreenState extends State<CameraScreen> {
           // 1. Two-Way Realtime Camera Synchronization with Dashboard
           final event = data['event'];
 
-          // Server ACK for mobile frame upload — unblocks next frame send
+          // Server ACK for mobile frame upload — opens sliding window slot
           if (event == 'frame_ack') {
-            _waitingForServerAck = false;
+            if (_inFlightFrames > 0) _inFlightFrames--;
             return;
           }
 
@@ -573,27 +578,26 @@ class _CameraScreenState extends State<CameraScreen> {
       final now = DateTime.now().millisecondsSinceEpoch;
 
       if (_isTailscaleIp) {
-        // === ACK-BASED FLOW CONTROL (Tailscale) ===
-        // Only send when server acknowledged the last frame, OR timeout expired.
-        // This prevents frame queue buildup over high-RTT VPN links.
-        if (_isFramePending) return; // Frame being compressed/sent
-        if (_waitingForServerAck) {
-          // Check if ACK timeout expired (server may have dropped the frame)
-          if (now - _lastFrameSendTime < _ackTimeoutMs) return;
-          // Timeout expired — unblock and try again
-          _waitingForServerAck = false;
+        // === SLIDING WINDOW FLOW CONTROL (Tailscale) ===
+        // Allow up to _tailscaleWindowSize frames in-flight simultaneously.
+        // Throughput = windowSize / RTT  →  2 / 0.150s = ~13 FPS on Tailscale.
+        if (_isFramePending) return; // Frame still being compressed
+        if (_inFlightFrames >= _tailscaleWindowSize) {
+          // Window full — check if oldest ACK has timed out (ACK lost or server busy)
+          if (now - _lastFrameSendTime < _tailscaleAckTimeoutMs) return;
+          // Timeout: reset window (treat all in-flight frames as delivered)
+          _inFlightFrames = 0;
         }
       } else {
         // === TIMER-BASED THROTTLE (WiFi) ===
-        // WiFi RTT is <5ms so simple timer throttle works perfectly.
+        // WiFi RTT <5ms, simple timer is perfect — no need for ACK overhead.
         if (now - _lastFrameSendTime < intervalMs || _isFramePending) return;
       }
 
       _lastFrameSendTime = now;
       _isFramePending = true;
       if (_isTailscaleIp) {
-        _waitingForServerAck = true;
-        _ackTimeoutMs = _tailscaleAckTimeoutMs;
+        _inFlightFrames++; // Occupy one window slot
       }
 
       try {
@@ -644,7 +648,7 @@ class _CameraScreenState extends State<CameraScreen> {
   void _stopPhoneCamera() {
     _isStreamingPhone = false;
     _isFramePending = false;
-    _waitingForServerAck = false;
+    _inFlightFrames = 0;
 
     try {
       _phoneCameraController?.stopImageStream();
