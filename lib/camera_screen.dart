@@ -93,6 +93,13 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   void initState() {
     super.initState();
+    // Allow rotation so live view can be viewed horizontally in landscape
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.portraitDown,
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
     _availableCameras = widget.cameras;
     if (_availableCameras.isEmpty) {
       availableCameras().then((cams) {
@@ -190,6 +197,17 @@ class _CameraScreenState extends State<CameraScreen> {
           // Server ACK for mobile frame upload — opens sliding window slot
           if (event == 'frame_ack') {
             if (_inFlightFrames > 0) _inFlightFrames--;
+            return;
+          }
+
+          // Remote Flip Camera command (triggered from Dashboard)
+          if (event == 'flip_camera' || data['command'] == 'flip_camera') {
+            debugPrint("[CameraSync] Received remote flip_camera command from Dashboard!");
+            if (_cameraMode == CameraMode.streamPhone) {
+              _flipCamera();
+            } else {
+              _startPhoneCamera();
+            }
             return;
           }
 
@@ -466,28 +484,63 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _flipCamera() async {
+    // 1. Refresh available cameras if list is empty or only 1 found
     if (_availableCameras.length < 2) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Only one camera available on this device')),
-      );
+      try {
+        final refreshed = await availableCameras();
+        if (refreshed.isNotEmpty) {
+          _availableCameras = refreshed;
+        }
+      } catch (e) {
+        debugPrint("[FlipCamera] Error fetching cameras: $e");
+      }
+    }
+
+    if (_availableCameras.length < 2) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Only one camera available on this device')),
+        );
+      }
       return;
     }
 
-    try {
-      _phoneCameraController?.stopImageStream();
-    } catch (_) {}
-    try {
-      _phoneCameraController?.dispose();
-    } catch (_) {}
+    // 2. Safely stop and dispose existing controller to avoid hardware lockups
+    final oldController = _phoneCameraController;
     _phoneCameraController = null;
+    if (oldController != null) {
+      try {
+        await oldController.stopImageStream();
+      } catch (_) {}
+      try {
+        await oldController.dispose();
+      } catch (_) {}
+    }
 
-    final newIndex = (_selectedCameraIndex + 1) % _availableCameras.length;
-    setState(() {
-      _selectedCameraIndex = newIndex;
-      _currentFrame = null;
-    });
+    // 3. Find the camera with the OPPOSITE lens direction (Front <-> Back)
+    final currentLens = (_selectedCameraIndex < _availableCameras.length)
+        ? _availableCameras[_selectedCameraIndex].lensDirection
+        : CameraLensDirection.back;
+    final targetLens = (currentLens == CameraLensDirection.front)
+        ? CameraLensDirection.back
+        : CameraLensDirection.front;
 
-    await _initPhoneCamera(_availableCameras[_selectedCameraIndex]);
+    int newIndex = _availableCameras.indexWhere((c) => c.lensDirection == targetLens);
+    if (newIndex == -1) {
+      // Fallback: cycle to next camera in list
+      newIndex = (_selectedCameraIndex + 1) % _availableCameras.length;
+    }
+
+    if (mounted) {
+      setState(() {
+        _selectedCameraIndex = newIndex;
+        _currentFrame = null;
+      });
+    }
+
+    final targetCamera = _availableCameras[newIndex];
+    debugPrint("[FlipCamera] Switching to camera $newIndex: ${targetCamera.name} (${targetCamera.lensDirection})");
+    await _initPhoneCamera(targetCamera);
   }
 
   Future<void> _initPhoneCamera(CameraDescription camera) async {
@@ -503,47 +556,85 @@ class _CameraScreenState extends State<CameraScreen> {
     }
 
     final isFront = camera.lensDirection == CameraLensDirection.front;
-    setState(() {
-      _currentStatusMessage = 'Switching to ${isFront ? "Front" : "Back"} camera...';
-      _currentStatusColor = Colors.orange.withValues(alpha: 0.8);
-    });
-
-    final controller = CameraController(
-      camera,
-      ResolutionPreset.medium, // 640x480 — Crystal-clear, high quality monitoring!
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.nv21,
-    );
-
-    try {
-      await controller.initialize();
-      if (!mounted || _isDisposed) {
-        controller.dispose();
-        return;
-      }
-
+    if (mounted) {
       setState(() {
-        _phoneCameraController = controller;
-        _isStreamingPhone = true;
-        _currentStatusMessage = '📱 ${isFront ? "Front" : "Back"} Camera (Live Stream)';
-        _currentStatusColor = Colors.teal.withValues(alpha: 0.9);
+        _currentStatusMessage = 'Switching to ${isFront ? "Front" : "Back"} camera...';
+        _currentStatusColor = Colors.orange.withValues(alpha: 0.8);
       });
+    }
 
-      // Notify backend + dashboard about camera switch
-      _notifyCameraSwitch('mobile_1');
-      _sendWsSubscribe('none');
+    // Tiered initialization for maximum Android device compatibility:
+    // Front cameras on many Android devices fail with nv21. yuv420 is universal CDD standard.
+    CameraController? controller;
 
-      // Start hardware-accelerated startImageStream (zero camera freeze, zero lag!)
-      _startPhoneStream(camera);
-    } catch (e) {
-      if (mounted && !_isDisposed) {
-        setState(() {
-          _currentStatusMessage = 'Camera init failed: $e';
-          _currentStatusColor = Colors.red;
-          _cameraMode = CameraMode.viewBackend;
-        });
+    // Attempt 1: YUV420 (Universal Android standard)
+    try {
+      controller = CameraController(
+        camera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+      await controller.initialize();
+    } catch (e1) {
+      debugPrint("[CameraInit] YUV420 init failed: $e1. Trying NV21...");
+      try {
+        await controller?.dispose();
+      } catch (_) {}
+      // Attempt 2: NV21 fallback
+      try {
+        controller = CameraController(
+          camera,
+          ResolutionPreset.medium,
+          enableAudio: false,
+          imageFormatGroup: ImageFormatGroup.nv21,
+        );
+        await controller.initialize();
+      } catch (e2) {
+        debugPrint("[CameraInit] NV21 init failed: $e2. Trying default format...");
+        try {
+          await controller?.dispose();
+        } catch (_) {}
+        // Attempt 3: Default format
+        try {
+          controller = CameraController(
+            camera,
+            ResolutionPreset.medium,
+            enableAudio: false,
+          );
+          await controller.initialize();
+        } catch (e3) {
+          debugPrint("[CameraInit] All format attempts failed: $e3");
+          if (mounted && !_isDisposed) {
+            setState(() {
+              _currentStatusMessage = 'Camera init failed: $e3';
+              _currentStatusColor = Colors.red;
+              _cameraMode = CameraMode.viewBackend;
+            });
+          }
+          return;
+        }
       }
     }
+
+    if (!mounted || _isDisposed) {
+      controller.dispose();
+      return;
+    }
+
+    setState(() {
+      _phoneCameraController = controller;
+      _isStreamingPhone = true;
+      _currentStatusMessage = '📱 ${isFront ? "Front" : "Back"} Camera (Live Stream)';
+      _currentStatusColor = Colors.teal.withValues(alpha: 0.9);
+    });
+
+    // Notify backend + dashboard about camera switch
+    _notifyCameraSwitch('mobile_1');
+    _sendWsSubscribe('none');
+
+    // Start hardware-accelerated startImageStream (zero camera freeze, zero lag!)
+    _startPhoneStream(camera);
   }
 
   /// Notify backend & dashboard about camera source change (syncs both sides)
@@ -604,13 +695,15 @@ class _CameraScreenState extends State<CameraScreen> {
         final Uint8List? jpegBytes = await _compressCameraImageToJpeg(image, quality: 70);
         if (jpegBytes == null || !_isStreamingPhone || !mounted || _isDisposed) return;
 
+        final bool isFront = camera.lensDirection == CameraLensDirection.front;
+
         // 16-byte binary MOBF header
         final header = ByteData(16);
         header.setUint32(0, 0x4D4F4246); // 'MOBF'
         header.setUint16(4, image.width);
         header.setUint16(6, image.height);
         header.setUint16(8, camera.sensorOrientation);
-        header.setUint8(10, _isFrontCamera ? 1 : 0);
+        header.setUint8(10, isFront ? 1 : 0);
         header.setUint8(11, 1); // 1 = JPEG format
         header.setUint32(12, now);
 
@@ -627,7 +720,7 @@ class _CameraScreenState extends State<CameraScreen> {
             Uri.parse('http://$_serverIp:8000/cameras/mobile/frame?'
                 'camera_id=$_phoneCameraId&'
                 'sensor_orientation=${camera.sensorOrientation}&'
-                'is_front=$_isFrontCamera&'
+                'is_front=$isFront&'
                 'width=${image.width}&'
                 'height=${image.height}&'
                 'format=jpeg'),
@@ -681,6 +774,9 @@ class _CameraScreenState extends State<CameraScreen> {
     _phoneCameraController?.dispose();
     _httpClient.close();
     _channel?.sink.close();
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+    ]);
     super.dispose();
   }
 
@@ -755,6 +851,22 @@ class _CameraScreenState extends State<CameraScreen> {
               }
             },
           ),
+          // Orientation toggle button (Portrait <-> Landscape)
+          IconButton(
+            icon: const Icon(Icons.screen_rotation),
+            tooltip: 'Toggle Screen Orientation',
+            onPressed: () {
+              final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+              if (isLandscape) {
+                SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+              } else {
+                SystemChrome.setPreferredOrientations([
+                  DeviceOrientation.landscapeLeft,
+                  DeviceOrientation.landscapeRight,
+                ]);
+              }
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.settings),
             tooltip: 'Change IP Address',
@@ -772,33 +884,40 @@ class _CameraScreenState extends State<CameraScreen> {
                 builder: (context, constraints) {
                   final double screenW = constraints.maxWidth;
                   final double screenH = constraints.maxHeight;
-                  // In portrait mode, camera aspect ratio is height/width (inverted)
+                  // Horizontal (landscape) widescreen aspect ratio for patient bed view
                   double rawAspect = _phoneCameraController!.value.aspectRatio;
-                  double cameraAspect = rawAspect > 1.0 ? (1.0 / rawAspect) : rawAspect;
+                  double cameraAspect = rawAspect < 1.0 ? (1.0 / rawAspect) : rawAspect;
 
                   double previewW, previewH;
                   if (screenW / screenH > cameraAspect) {
-                    previewW = screenW;
-                    previewH = screenW / cameraAspect;
-                  } else {
+                    // Screen is wider than camera ratio
                     previewH = screenH;
                     previewW = screenH * cameraAspect;
+                  } else {
+                    // Screen is taller than camera ratio (letterbox horizontal view)
+                    previewW = screenW;
+                    previewH = screenW / cameraAspect;
                   }
                   final double dx = (screenW - previewW) / 2.0;
                   final double dy = (screenH - previewH) / 2.0;
 
-                  return Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      // Centered & fitted HD CameraPreview
-                      Positioned(
-                        left: dx,
-                        top: dy,
-                        width: previewW,
-                        height: previewH,
-                        child: CameraPreview(_phoneCameraController!),
-                      ),
-                    ],
+                  return Container(
+                    color: Colors.black,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        // Centered & fitted horizontal CameraPreview
+                        Positioned(
+                          left: dx,
+                          top: dy,
+                          width: previewW,
+                          height: previewH,
+                          child: ClipRect(
+                            child: CameraPreview(_phoneCameraController!),
+                          ),
+                        ),
+                      ],
+                    ),
                   );
                 },
               )
@@ -807,10 +926,15 @@ class _CameraScreenState extends State<CameraScreen> {
           ] else if (_cameraMode == CameraMode.viewBackend) ...[
             // Backend camera feed (laptop webcam / CCTV / mobile with MediaPipe skeleton)
             if (_currentFrame != null)
-              Image.memory(
-                _currentFrame!,
-                fit: BoxFit.cover,
-                gaplessPlayback: true,
+              Container(
+                color: Colors.black,
+                child: Center(
+                  child: Image.memory(
+                    _currentFrame!,
+                    fit: BoxFit.contain, // Full horizontal wide view without cropping!
+                    gaplessPlayback: true,
+                  ),
+                ),
               )
             else
               const Center(
