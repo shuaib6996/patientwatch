@@ -444,6 +444,21 @@ class _CameraScreenState extends State<CameraScreen> {
     final now = DateTime.now();
     await _firebaseService.logEvent(widget.patient.deviceId, eventType);
     await _whatsappService.sendAlert(eventType, now);
+
+    // Forward event to backend WebSocket so dashboard displays notification immediately
+    try {
+      _channel?.sink.add(jsonEncode({
+        'type': 'patient_event',
+        'event_type': eventType,
+        'device_id': _phoneCameraId,
+        'name_or_bed_label': _deviceDisplayName,
+        'message': message,
+        'note': message,
+        'timestamp': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      }));
+    } catch (e) {
+      debugPrint("Error forwarding patient event over WS: $e");
+    }
   }
 
   // ============================================================
