@@ -67,6 +67,16 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _isFramePending = false;
   bool get _isTailscaleIp => _serverIp.startsWith('100.');
 
+  // ACK-based flow control for Tailscale:
+  // Instead of a fixed timer (which causes queue buildup over high-RTT links),
+  // we track whether the server has acknowledged processing the last frame.
+  // On WiFi (RTT < 5ms), ACK arrives instantly → same throughput as before.
+  // On Tailscale (RTT 50-150ms), we wait for ACK before sending next frame →
+  // no queue buildup, always fresh frames, no lag.
+  bool _waitingForServerAck = false;
+  int _ackTimeoutMs = 0; // If ACK doesn't come within this window, force-unblock
+  static const int _tailscaleAckTimeoutMs = 400; // Tailscale: 400ms timeout
+
 
   bool get _isFrontCamera {
     if (_availableCameras.isEmpty || _selectedCameraIndex >= _availableCameras.length) {
@@ -171,6 +181,13 @@ class _CameraScreenState extends State<CameraScreen> {
           
           // 1. Two-Way Realtime Camera Synchronization with Dashboard
           final event = data['event'];
+
+          // Server ACK for mobile frame upload — unblocks next frame send
+          if (event == 'frame_ack') {
+            _waitingForServerAck = false;
+            return;
+          }
+
           if (event == 'camera_switched' || event == 'initial_state') {
             final targetCam = (data['camera_id'] ?? data['active_camera_id']) as String?;
             if (targetCam != null) {
@@ -542,20 +559,42 @@ class _CameraScreenState extends State<CameraScreen> {
     } catch (_) {}
   }
 
-  /// Hardware-accelerated startImageStream streaming 25-35 KB crisp JPEG packets over WebSocket
+  /// Hardware-accelerated startImageStream streaming crisp JPEG packets over WebSocket
   void _startPhoneStream(CameraDescription camera) {
     if (_phoneCameraController == null || !_phoneCameraController!.value.isInitialized) return;
 
-    // Adaptive frame interval: Tailscale: ~9-10 FPS (110ms), WiFi: ~15 FPS (65ms)
-    final int intervalMs = _isTailscaleIp ? 110 : 65;
+    // Timer interval for WiFi fallback throttle
+    // WiFi: 15 FPS (65ms). Tailscale: ACK-based (no fixed timer — RTT is the natural throttle).
+    const int intervalMs = 65;
 
     _phoneCameraController!.startImageStream((CameraImage image) async {
       if (!_isStreamingPhone || !mounted || _isDisposed) return;
 
       final now = DateTime.now().millisecondsSinceEpoch;
-      if (now - _lastFrameSendTime < intervalMs || _isFramePending) return;
+
+      if (_isTailscaleIp) {
+        // === ACK-BASED FLOW CONTROL (Tailscale) ===
+        // Only send when server acknowledged the last frame, OR timeout expired.
+        // This prevents frame queue buildup over high-RTT VPN links.
+        if (_isFramePending) return; // Frame being compressed/sent
+        if (_waitingForServerAck) {
+          // Check if ACK timeout expired (server may have dropped the frame)
+          if (now - _lastFrameSendTime < _ackTimeoutMs) return;
+          // Timeout expired — unblock and try again
+          _waitingForServerAck = false;
+        }
+      } else {
+        // === TIMER-BASED THROTTLE (WiFi) ===
+        // WiFi RTT is <5ms so simple timer throttle works perfectly.
+        if (now - _lastFrameSendTime < intervalMs || _isFramePending) return;
+      }
+
       _lastFrameSendTime = now;
       _isFramePending = true;
+      if (_isTailscaleIp) {
+        _waitingForServerAck = true;
+        _ackTimeoutMs = _tailscaleAckTimeoutMs;
+      }
 
       try {
         final Uint8List? jpegBytes = await _compressCameraImageToJpeg(image, quality: 70);
@@ -593,9 +632,11 @@ class _CameraScreenState extends State<CameraScreen> {
           ).catchError((_) => http.Response('', 500));
         }
       } catch (e) {
-        debugPrint("[PhoneStream Error] $e");
+        debugPrint('[PhoneStream Error] $e');
       } finally {
         _isFramePending = false;
+        // Note: _waitingForServerAck remains true until server sends frame_ack.
+        // This is intentional — it blocks the next frame send on Tailscale.
       }
     });
   }
@@ -603,6 +644,7 @@ class _CameraScreenState extends State<CameraScreen> {
   void _stopPhoneCamera() {
     _isStreamingPhone = false;
     _isFramePending = false;
+    _waitingForServerAck = false;
 
     try {
       _phoneCameraController?.stopImageStream();
