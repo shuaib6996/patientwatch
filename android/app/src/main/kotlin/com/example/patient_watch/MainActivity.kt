@@ -16,7 +16,23 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
-            if (call.method == "compressYuvToJpeg") {
+            if (call.method == "getDeviceModel") {
+                try {
+                    val manufacturer = android.os.Build.MANUFACTURER
+                    val model = android.os.Build.MODEL
+                    val deviceName = if (model.lowercase().startsWith(manufacturer.lowercase())) {
+                        model
+                    } else {
+                        val mfgCap = manufacturer.replaceFirstChar {
+                            if (it.isLowerCase()) it.titlecase() else it.toString()
+                        }
+                        "$mfgCap $model"
+                    }
+                    result.success(deviceName)
+                } catch (e: Exception) {
+                    result.success("Android Phone")
+                }
+            } else if (call.method == "compressYuvToJpeg") {
                 try {
                     val width = call.argument<Int>("width") ?: 0
                     val height = call.argument<Int>("height") ?: 0

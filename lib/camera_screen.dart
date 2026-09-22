@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -83,6 +84,32 @@ class _CameraScreenState extends State<CameraScreen> {
   int _inFlightFrames = 0;  // frames sent but not yet ACK'd by server
 
 
+  String _deviceModel = 'Android Phone';
+
+  String get _deviceDisplayName {
+    if (widget.patient.name.isNotEmpty) {
+      return '$_deviceModel (${widget.patient.name})';
+    }
+    return _deviceModel;
+  }
+
+  Future<void> _loadDeviceModel() async {
+    try {
+      final String? model = await _compressorChannel.invokeMethod<String>('getDeviceModel');
+      if (model != null && model.isNotEmpty) {
+        if (mounted) {
+          setState(() {
+            _deviceModel = model;
+          });
+        } else {
+          _deviceModel = model;
+        }
+      }
+    } catch (e) {
+      debugPrint("Error fetching device model: $e");
+    }
+  }
+
   bool get _isFrontCamera {
     if (_availableCameras.isEmpty || _selectedCameraIndex >= _availableCameras.length) {
       return false;
@@ -93,6 +120,7 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   void initState() {
     super.initState();
+    _loadDeviceModel();
     // Allow rotation so live view can be viewed horizontally in landscape
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.portraitUp,
@@ -101,7 +129,7 @@ class _CameraScreenState extends State<CameraScreen> {
       DeviceOrientation.landscapeRight,
     ]);
     _availableCameras = widget.cameras;
-    if (_availableCameras.isEmpty) {
+    if (Platform.isAndroid) {
       availableCameras().then((cams) {
         if (mounted) {
           setState(() {
@@ -130,14 +158,19 @@ class _CameraScreenState extends State<CameraScreen> {
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode({
           'device_id': _phoneCameraId,
-          'name': widget.patient.name.isNotEmpty
-              ? 'Phone - ${widget.patient.name}'
-              : 'Android Phone',
+          'name': _deviceDisplayName,
+          'model': _deviceModel,
           'type': 'mobile_app',
         }),
       ).timeout(const Duration(seconds: 3));
-      // Also send websocket keepalive ping
-      _channel?.sink.add(jsonEncode({'heartbeat': _phoneCameraId}));
+      // Also send websocket keepalive & identification ping
+      _channel?.sink.add(jsonEncode({
+        'type': 'device_identify',
+        'heartbeat': _phoneCameraId,
+        'device_id': _phoneCameraId,
+        'name': _deviceDisplayName,
+        'model': _deviceModel,
+      }));
     } catch (e) {
       // Backend may be starting or offline
     }
@@ -176,6 +209,14 @@ class _CameraScreenState extends State<CameraScreen> {
 
     try {
       _channel = WebSocketChannel.connect(Uri.parse('ws://$_serverIp:8765'));
+
+      // Identify device to backend WebSocket immediately
+      _channel!.sink.add(jsonEncode({
+        'type': 'device_identify',
+        'device_id': _phoneCameraId,
+        'name': _deviceDisplayName,
+        'model': _deviceModel,
+      }));
 
       // In phone camera mode, subscribe to 'none' so no video loopback floods the phone
       _sendWsSubscribe(_cameraMode == CameraMode.streamPhone ? 'none' : 'laptop_0');
