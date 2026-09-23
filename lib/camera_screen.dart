@@ -288,10 +288,12 @@ class _CameraScreenState extends State<CameraScreen> {
           
           setState(() {
             _currentFrame = imageBytes;
-            _currentStatusMessage = _baselineService.isCalibrating 
-                ? 'Calibrating...' 
-                : 'Monitoring...';
-            _currentStatusColor = Colors.green.withValues(alpha: 0.8);
+            if (_statusEndTime == null || DateTime.now().isAfter(_statusEndTime!)) {
+              _currentStatusMessage = _baselineService.isCalibrating 
+                  ? 'Calibrating...' 
+                  : 'Monitoring...';
+              _currentStatusColor = Colors.green.withValues(alpha: 0.8);
+            }
           });
         } catch (e) {
           debugPrint("Error parsing websocket data: $e");
@@ -357,27 +359,36 @@ class _CameraScreenState extends State<CameraScreen> {
     } else {
       await _activityClassifier.classifyActivity(pose, widget.patient.deviceId);
 
-      // Check Level 1 Active Gestures (Calling Doctor, Washroom, Water, Blanket, Chest Pain)
+      // Check Level 1 Active Gestures (Emergency Help, Washroom, Water, Blanket, Chest Pain)
       final gestureResult = _gestureDetectionLogic.detectGesture(pose);
       if (gestureResult.gesture != DetectedGesture.none) {
-        Color gestureColor = Colors.orange;
-        if (gestureResult.gesture == DetectedGesture.emergencyHelpWave) {
-          gestureColor = Colors.red;
-        } else if (gestureResult.gesture == DetectedGesture.waterRequest) {
-          gestureColor = Colors.blue;
-        } else if (gestureResult.gesture == DetectedGesture.washroomRequest) {
-          gestureColor = Colors.amber.shade800;
-        } else if (gestureResult.gesture == DetectedGesture.blanketRequest) {
-          gestureColor = Colors.teal;
-        } else if (gestureResult.gesture == DetectedGesture.chestPainDistress) {
-          gestureColor = Colors.deepOrange;
-        }
+        if (gestureResult.isConfirmed) {
+          Color gestureColor = Colors.orange;
+          if (gestureResult.gesture == DetectedGesture.emergencyHelpWave) {
+            gestureColor = Colors.red;
+          } else if (gestureResult.gesture == DetectedGesture.waterRequest) {
+            gestureColor = Colors.blue;
+          } else if (gestureResult.gesture == DetectedGesture.washroomRequest) {
+            gestureColor = Colors.amber.shade800;
+          } else if (gestureResult.gesture == DetectedGesture.blanketRequest) {
+            gestureColor = Colors.teal;
+          } else if (gestureResult.gesture == DetectedGesture.chestPainDistress) {
+            gestureColor = Colors.deepOrange;
+          }
 
-        _handleEventDetected(
-          gestureResult.eventType,
-          gestureResult.displayTitle,
-          gestureColor.withValues(alpha: 0.95),
-        );
+          _handleEventDetected(
+            gestureResult.eventType,
+            '✓ CONFIRMED: ${gestureResult.displayTitle}',
+            gestureColor.withValues(alpha: 0.95),
+          );
+        } else if (gestureResult.isHolding) {
+          // Live intentional hold feedback countdown on screen
+          setState(() {
+            _currentStatusMessage = gestureResult.holdFeedbackText;
+            _currentStatusColor = gestureResult.holdColor.withValues(alpha: 0.9);
+            _statusEndTime = DateTime.now().add(const Duration(milliseconds: 600));
+          });
+        }
       }
 
       final isBedExit = _bedExitDetector.detectBedExit(

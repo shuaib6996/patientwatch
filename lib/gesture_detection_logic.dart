@@ -1,4 +1,5 @@
 import 'dart:math';
+import 'package:flutter/material.dart';
 import 'models/pose.dart';
 
 enum DetectedGesture {
@@ -15,12 +16,22 @@ class GestureResult {
   final String eventType;
   final String displayTitle;
   final String alertMessage;
+  final bool isConfirmed;
+  final bool isHolding;
+  final double holdProgress;
+  final String holdFeedbackText;
+  final Color holdColor;
 
   const GestureResult({
     required this.gesture,
     required this.eventType,
     required this.displayTitle,
     required this.alertMessage,
+    this.isConfirmed = false,
+    this.isHolding = false,
+    this.holdProgress = 0.0,
+    this.holdFeedbackText = '',
+    this.holdColor = Colors.orange,
   });
 
   static const empty = GestureResult(
@@ -28,10 +39,18 @@ class GestureResult {
     eventType: '',
     displayTitle: '',
     alertMessage: '',
+    isConfirmed: false,
+    isHolding: false,
+    holdProgress: 0.0,
+    holdFeedbackText: '',
+    holdColor: Colors.grey,
   );
 }
 
 class GestureDetectionLogic {
+  // 3.0 seconds intentional hold required to prevent accidental triggers
+  static const int holdDurationMs = 3000;
+
   // Cooldowns per gesture to prevent spamming notifications
   final Map<DetectedGesture, DateTime> _lastTriggered = {};
   static const Duration _cooldown = Duration(seconds: 30);
@@ -47,7 +66,10 @@ class GestureDetectionLogic {
   final List<DateTime> _wristTimeHistory = [];
 
   GestureResult detectGesture(Pose pose) {
-    if (pose.landmarks.isEmpty) return GestureResult.empty;
+    if (pose.landmarks.isEmpty) {
+      _resetHoldTimers();
+      return GestureResult.empty;
+    }
 
     final now = DateTime.now();
 
@@ -61,11 +83,17 @@ class GestureDetectionLogic {
     final leftHip = pose.landmarks[PoseLandmarkType.leftHip];
     final rightHip = pose.landmarks[PoseLandmarkType.rightHip];
 
-    if (leftShoulder == null || rightShoulder == null) return GestureResult.empty;
+    if (leftShoulder == null || rightShoulder == null) {
+      _resetHoldTimers();
+      return GestureResult.empty;
+    }
 
     // Body scale reference metrics
     final shoulderWidth = (leftShoulder.x - rightShoulder.x).abs();
-    if (shoulderWidth < 20) return GestureResult.empty; // Person too small or invalid pose
+    if (shoulderWidth < 20) {
+      _resetHoldTimers();
+      return GestureResult.empty; // Person too small or invalid pose
+    }
 
     final midShoulderX = (leftShoulder.x + rightShoulder.x) / 2.0;
     final midShoulderY = (leftShoulder.y + rightShoulder.y) / 2.0;
@@ -108,6 +136,8 @@ class GestureDetectionLogic {
             eventType: 'emergency_help_wave',
             displayTitle: '🚨 HELP WAVE DETECTED',
             alertMessage: 'Patient is waving for emergency help! Immediate assistance required.',
+            isConfirmed: true,
+            holdProgress: 1.0,
           );
         }
       } else {
@@ -132,7 +162,10 @@ class GestureDetectionLogic {
 
       if (handOnChest) {
         _chestPainGestureStart ??= now;
-        if (now.difference(_chestPainGestureStart!).inMilliseconds >= 2500) {
+        final elapsed = now.difference(_chestPainGestureStart!).inMilliseconds;
+        final progress = (elapsed / holdDurationMs).clamp(0.0, 1.0);
+
+        if (elapsed >= holdDurationMs) {
           _chestPainGestureStart = null;
           _lastTriggered[DetectedGesture.chestPainDistress] = now;
           return const GestureResult(
@@ -140,6 +173,21 @@ class GestureDetectionLogic {
             eventType: 'chest_pain_distress',
             displayTitle: '⚠️ CHEST PAIN DISTRESS DETECTED',
             alertMessage: 'Patient clutching chest (possible acute pain or cardiac distress).',
+            isConfirmed: true,
+            holdProgress: 1.0,
+          );
+        } else {
+          final elapsedSec = (elapsed / 1000.0).toStringAsFixed(1);
+          return GestureResult(
+            gesture: DetectedGesture.chestPainDistress,
+            eventType: 'chest_pain_distress',
+            displayTitle: 'HOLDING: Chest Pain Sign',
+            alertMessage: '',
+            isConfirmed: false,
+            isHolding: true,
+            holdProgress: progress,
+            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): CHEST PAIN SIGN',
+            holdColor: Colors.deepOrange,
           );
         }
       } else {
@@ -148,7 +196,7 @@ class GestureDetectionLogic {
     }
 
     // -------------------------------------------------------------
-    // 3. WATER REQUEST (पानी का इशारा - Hand Near Mouth) - Priority: YELLOW
+    // 3. WATER REQUEST (पानी का इशारा - Hand Near Mouth) - Priority: BLUE
     // -------------------------------------------------------------
     if (!_isCoolingDown(DetectedGesture.waterRequest, now) && nose != null) {
       bool handNearMouth = false;
@@ -163,7 +211,10 @@ class GestureDetectionLogic {
 
       if (handNearMouth) {
         _waterGestureStart ??= now;
-        if (now.difference(_waterGestureStart!).inMilliseconds >= 2000) {
+        final elapsed = now.difference(_waterGestureStart!).inMilliseconds;
+        final progress = (elapsed / holdDurationMs).clamp(0.0, 1.0);
+
+        if (elapsed >= holdDurationMs) {
           _waterGestureStart = null;
           _lastTriggered[DetectedGesture.waterRequest] = now;
           return const GestureResult(
@@ -171,6 +222,21 @@ class GestureDetectionLogic {
             eventType: 'water_request',
             displayTitle: '💧 WATER REQUESTED',
             alertMessage: 'Patient is thirsty and requesting water / hydration assistance.',
+            isConfirmed: true,
+            holdProgress: 1.0,
+          );
+        } else {
+          final elapsedSec = (elapsed / 1000.0).toStringAsFixed(1);
+          return GestureResult(
+            gesture: DetectedGesture.waterRequest,
+            eventType: 'water_request',
+            displayTitle: 'HOLDING: Water Request',
+            alertMessage: '',
+            isConfirmed: false,
+            isHolding: true,
+            holdProgress: progress,
+            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): 💧 WATER REQUEST',
+            holdColor: Colors.blue,
           );
         }
       } else {
@@ -179,7 +245,7 @@ class GestureDetectionLogic {
     }
 
     // -------------------------------------------------------------
-    // 4. WASHROOM / TOILET REQUEST (टॉयलेट जाना है - Steady Raised Hand or Pelvic Sign)
+    // 4. WASHROOM / TOILET REQUEST (टॉयलेट जाना है - Steady Raised Hand or Pelvic Sign) - Priority: AMBER
     // -------------------------------------------------------------
     if (!_isCoolingDown(DetectedGesture.washroomRequest, now)) {
       // Steady raised hand (forearm upright without waving) OR hand resting over lower abdomen
@@ -206,7 +272,10 @@ class GestureDetectionLogic {
 
       if (steadyRaisedHand || handOnAbdomen) {
         _washroomGestureStart ??= now;
-        if (now.difference(_washroomGestureStart!).inMilliseconds >= 2500) {
+        final elapsed = now.difference(_washroomGestureStart!).inMilliseconds;
+        final progress = (elapsed / holdDurationMs).clamp(0.0, 1.0);
+
+        if (elapsed >= holdDurationMs) {
           _washroomGestureStart = null;
           _lastTriggered[DetectedGesture.washroomRequest] = now;
           return const GestureResult(
@@ -214,6 +283,21 @@ class GestureDetectionLogic {
             eventType: 'washroom_request',
             displayTitle: '🚻 WASHROOM ASSISTANCE REQUESTED',
             alertMessage: 'Patient needs toilet / washroom assistance. Routine care needed.',
+            isConfirmed: true,
+            holdProgress: 1.0,
+          );
+        } else {
+          final elapsedSec = (elapsed / 1000.0).toStringAsFixed(1);
+          return GestureResult(
+            gesture: DetectedGesture.washroomRequest,
+            eventType: 'washroom_request',
+            displayTitle: 'HOLDING: Washroom Request',
+            alertMessage: '',
+            isConfirmed: false,
+            isHolding: true,
+            holdProgress: progress,
+            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): 🚻 WASHROOM REQUEST',
+            holdColor: Colors.amber.shade800,
           );
         }
       } else {
@@ -222,12 +306,11 @@ class GestureDetectionLogic {
     }
 
     // -------------------------------------------------------------
-    // 5. BLANKET / COLD (ठंड / चादर - Crossed Arms Hugging Self) - Priority: GREEN
+    // 5. BLANKET / COLD (ठंड / चादर - Crossed Arms Hugging Self) - Priority: TEAL
     // -------------------------------------------------------------
     if (!_isCoolingDown(DetectedGesture.blanketRequest, now)) {
       bool armsCrossed = false;
       if (leftWrist != null && rightWrist != null) {
-        // Left wrist is on right side of torso, and right wrist is on left side of torso
         final leftCrossed = leftWrist.x > midShoulderX;
         final rightCrossed = rightWrist.x < midShoulderX;
         final wristsNearChest = (leftWrist.y - chestY).abs() < shoulderWidth * 0.6 &&
@@ -239,7 +322,10 @@ class GestureDetectionLogic {
 
       if (armsCrossed) {
         _blanketGestureStart ??= now;
-        if (now.difference(_blanketGestureStart!).inMilliseconds >= 2500) {
+        final elapsed = now.difference(_blanketGestureStart!).inMilliseconds;
+        final progress = (elapsed / holdDurationMs).clamp(0.0, 1.0);
+
+        if (elapsed >= holdDurationMs) {
           _blanketGestureStart = null;
           _lastTriggered[DetectedGesture.blanketRequest] = now;
           return const GestureResult(
@@ -247,6 +333,21 @@ class GestureDetectionLogic {
             eventType: 'blanket_request',
             displayTitle: '🛌 BLANKET / COLD REPORTED',
             alertMessage: 'Patient is feeling cold and requesting an extra blanket.',
+            isConfirmed: true,
+            holdProgress: 1.0,
+          );
+        } else {
+          final elapsedSec = (elapsed / 1000.0).toStringAsFixed(1);
+          return GestureResult(
+            gesture: DetectedGesture.blanketRequest,
+            eventType: 'blanket_request',
+            displayTitle: 'HOLDING: Blanket Request',
+            alertMessage: '',
+            isConfirmed: false,
+            isHolding: true,
+            holdProgress: progress,
+            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): 🛌 BLANKET REQUEST',
+            holdColor: Colors.teal,
           );
         }
       } else {
@@ -255,6 +356,15 @@ class GestureDetectionLogic {
     }
 
     return GestureResult.empty;
+  }
+
+  void _resetHoldTimers() {
+    _waterGestureStart = null;
+    _washroomGestureStart = null;
+    _blanketGestureStart = null;
+    _chestPainGestureStart = null;
+    _wristXHistory.clear();
+    _wristTimeHistory.clear();
   }
 
   bool _isCoolingDown(DetectedGesture gesture, DateTime now) {
