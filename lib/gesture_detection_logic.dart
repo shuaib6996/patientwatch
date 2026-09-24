@@ -48,8 +48,11 @@ class GestureResult {
 }
 
 class GestureDetectionLogic {
-  // 3.0 seconds intentional hold required to prevent accidental triggers
+  // Intentional hold durations required to prevent accidental triggers
   static const int holdDurationMs = 3000;
+  static const int waterHoldDurationMs = 5000; // 5.0 seconds hold for ASL Water Sign
+  static const int chestHoldDurationMs = 7000; // 7.0 seconds hold with both hands on chest
+  static const int blanketHoldDurationMs = 7000; // 7.0 seconds hold with hands crossed on shoulders
 
   // Cooldowns per gesture to prevent spamming notifications
   final Map<DetectedGesture, DateTime> _lastTriggered = {};
@@ -59,7 +62,14 @@ class GestureDetectionLogic {
   DateTime? _waterGestureStart;
   DateTime? _washroomGestureStart;
   DateTime? _blanketGestureStart;
-  DateTime? _chestPainGestureStart;
+
+  // Chest Pain Distress tracking: 7s Hold with Both Hands + 3 Fist Close-Open Cycles
+  DateTime? _chestPainHoldStart;
+  String _chestPainPhase = "IDLE"; // "IDLE", "HOLD_7S", "WAIT_CLOSE", "WAIT_OPEN"
+  int _chestPainCycles = 0;
+  DateTime? _chestPainPhaseTime;
+  DateTime? _chestPainPumpsStartTime;
+  DateTime? _chestPainLastHandsNear;
 
   // Emergency Help tracking: 3 Open-Close cycles
   int _emergencyCycles = 0;
@@ -75,7 +85,6 @@ class GestureDetectionLogic {
 
     final now = DateTime.now();
 
-    final nose = pose.landmarks[PoseLandmarkType.nose];
     final leftShoulder = pose.landmarks[PoseLandmarkType.leftShoulder];
     final rightShoulder = pose.landmarks[PoseLandmarkType.rightShoulder];
     final leftElbow = pose.landmarks[PoseLandmarkType.leftElbow];
@@ -88,6 +97,8 @@ class GestureDetectionLogic {
     final rightIndex = pose.landmarks[PoseLandmarkType.rightIndex];
     final leftPinky = pose.landmarks[PoseLandmarkType.leftPinky];
     final rightPinky = pose.landmarks[PoseLandmarkType.rightPinky];
+    final leftThumb = pose.landmarks[PoseLandmarkType.leftThumb];
+    final rightThumb = pose.landmarks[PoseLandmarkType.rightThumb];
 
     if (leftShoulder == null || rightShoulder == null) {
       _resetHoldTimers();
@@ -114,13 +125,15 @@ class GestureDetectionLogic {
     final chestX = midShoulderX;
     final chestY = midShoulderY + (midHipY - midShoulderY) * 0.35;
 
-    // Hand shape classification
-    final leftOpenPalm = _isOpenPalm(leftWrist, leftIndex, leftPinky, shoulderWidth);
-    final rightOpenPalm = _isOpenPalm(rightWrist, rightIndex, rightPinky, shoulderWidth);
-    final leftFist = _isFist(leftWrist, leftIndex, leftPinky, shoulderWidth);
-    final rightFist = _isFist(rightWrist, rightIndex, rightPinky, shoulderWidth);
-    final leftOneFinger = _isOneFinger(leftWrist, leftIndex, leftPinky, shoulderWidth);
-    final rightOneFinger = _isOneFinger(rightWrist, rightIndex, rightPinky, shoulderWidth);
+    // Hand shape classification (ASL Water Sign: 3 fingers up, thumb & pinky joined)
+    final leftWaterSign = _isWaterSign(leftWrist, leftIndex, leftPinky, leftThumb, shoulderWidth);
+    final rightWaterSign = _isWaterSign(rightWrist, rightIndex, rightPinky, rightThumb, shoulderWidth);
+    final leftOpenPalm = _isOpenPalm(leftWrist, leftIndex, leftPinky, leftThumb, shoulderWidth);
+    final rightOpenPalm = _isOpenPalm(rightWrist, rightIndex, rightPinky, rightThumb, shoulderWidth);
+    final leftFist = _isFist(leftWrist, leftIndex, leftPinky, shoulderWidth) && !leftWaterSign;
+    final rightFist = _isFist(rightWrist, rightIndex, rightPinky, shoulderWidth) && !rightWaterSign;
+    final leftOneFinger = _isOneFinger(leftWrist, leftIndex, leftPinky, leftThumb, shoulderWidth);
+    final rightOneFinger = _isOneFinger(rightWrist, rightIndex, rightPinky, rightThumb, shoulderWidth);
 
     // -------------------------------------------------------------
     // 1. EMERGENCY HELP: 3 OPEN & CLOSE FIST CYCLES (🖐 -> ✊ -> 🖐 x3)
@@ -218,81 +231,169 @@ class GestureDetectionLogic {
     }
 
     // -------------------------------------------------------------
-    // 2. CHEST PAIN / LEVINE'S SIGN (छाती पर हाथ - Severe Pain) - Priority: ORANGE
+    // 2. CHEST PAIN DISTRESS (Both Hands on Chest 7s + 3 Close-Open Fist Cycles)
     // -------------------------------------------------------------
     if (!_isCoolingDown(DetectedGesture.chestPainDistress, now)) {
-      bool handOnChest = false;
-      if (leftWrist != null) {
-        final dist = _distance(leftWrist.x, leftWrist.y, chestX, chestY);
-        if (dist < shoulderWidth * 0.35) handOnChest = true;
-      }
-      if (rightWrist != null) {
-        final dist = _distance(rightWrist.x, rightWrist.y, chestX, chestY);
-        if (dist < shoulderWidth * 0.35) handOnChest = true;
+      // Both hands on chest (within 0.50 of shoulder width from chest center)
+      final leftOnChest = leftWrist != null && _distance(leftWrist.x, leftWrist.y, chestX, chestY) < shoulderWidth * 0.50;
+      final rightOnChest = rightWrist != null && _distance(rightWrist.x, rightWrist.y, chestX, chestY) < shoulderWidth * 0.50;
+      final bothHandsOnChest = leftOnChest && rightOnChest;
+
+      // In fist-pumping phase, at least one hand clutching or near chest (< 0.65 shoulder width)
+      final leftNearChest = leftWrist != null && _distance(leftWrist.x, leftWrist.y, chestX, chestY) < shoulderWidth * 0.65;
+      final rightNearChest = rightWrist != null && _distance(rightWrist.x, rightWrist.y, chestX, chestY) < shoulderWidth * 0.65;
+      final handsNearChest = leftNearChest || rightNearChest;
+
+      if (handsNearChest) {
+        _chestPainLastHandsNear = now;
       }
 
-      if (handOnChest) {
-        _chestPainGestureStart ??= now;
-        final elapsed = now.difference(_chestPainGestureStart!).inMilliseconds;
-        final progress = (elapsed / holdDurationMs).clamp(0.0, 1.0);
+      // If hands have been away from chest for more than 2.0s, reset
+      if (_chestPainLastHandsNear != null && now.difference(_chestPainLastHandsNear!).inMilliseconds > 2000) {
+        _chestPainPhase = "IDLE";
+        _chestPainHoldStart = null;
+        _chestPainCycles = 0;
+        _chestPainPumpsStartTime = null;
+      }
 
-        if (elapsed >= holdDurationMs) {
-          _chestPainGestureStart = null;
-          _lastTriggered[DetectedGesture.chestPainDistress] = now;
-          return const GestureResult(
-            gesture: DetectedGesture.chestPainDistress,
-            eventType: 'chest_pain_distress',
-            displayTitle: '⚠️ CHEST PAIN DISTRESS DETECTED',
-            alertMessage: 'Patient clutching chest (possible acute pain or cardiac distress).',
-            isConfirmed: true,
-            holdProgress: 1.0,
-          );
+      // Phase 1: Hold Both Hands on Chest for 7.0 seconds
+      if (_chestPainPhase == "IDLE") {
+        if (bothHandsOnChest) {
+          _chestPainPhase = "HOLD_7S";
+          _chestPainHoldStart = now;
+          _chestPainCycles = 0;
+          _chestPainLastHandsNear = now;
+        }
+      }
+
+      if (_chestPainPhase == "HOLD_7S") {
+        if (bothHandsOnChest) {
+          final elapsed = now.difference(_chestPainHoldStart ?? now).inMilliseconds;
+          if (elapsed < chestHoldDurationMs) {
+            final elapsedSec = (elapsed / 1000.0).toStringAsFixed(1);
+            final progress = (elapsed / chestHoldDurationMs).clamp(0.0, 1.0) * 0.50;
+            return GestureResult(
+              gesture: DetectedGesture.chestPainDistress,
+              eventType: 'chest_pain_distress',
+              displayTitle: '⚠️ CHEST PAIN: Hold Both Hands ($elapsedSec s / 7.0s)',
+              alertMessage: '',
+              isConfirmed: false,
+              isHolding: true,
+              holdProgress: progress,
+              holdFeedbackText: 'HOLD ($elapsedSec s / 7.0s): ⚠️ HOLD BOTH HANDS ON CHEST',
+              holdColor: Colors.deepOrange,
+            );
+          } else {
+            // 7.0s completed! Transition to Phase 2: Close & Open fist 3 times
+            _chestPainPhase = "WAIT_CLOSE";
+            _chestPainPumpsStartTime = now;
+            _chestPainPhaseTime = now;
+            _chestPainCycles = 0;
+            return const GestureResult(
+              gesture: DetectedGesture.chestPainDistress,
+              eventType: 'chest_pain_distress',
+              displayTitle: '⚠️ CHEST PAIN: Close & Open Fist 3x (0/3)',
+              alertMessage: '',
+              isConfirmed: false,
+              isHolding: true,
+              holdProgress: 0.52,
+              holdFeedbackText: '✊ CHEST PAIN: CLOSE & OPEN FIST 3 TIMES',
+              holdColor: Colors.red,
+            );
+          }
         } else {
-          final elapsedSec = (elapsed / 1000.0).toStringAsFixed(1);
+          // Released both hands before 7s
+          _chestPainPhase = "IDLE";
+          _chestPainHoldStart = null;
+        }
+      } else if (_chestPainPhase == "WAIT_CLOSE" || _chestPainPhase == "WAIT_OPEN") {
+        // Overall timeout of 12 seconds for the 3 fist cycles
+        if (_chestPainPumpsStartTime != null && now.difference(_chestPainPumpsStartTime!).inMilliseconds > 12000) {
+          _chestPainPhase = "IDLE";
+          _chestPainHoldStart = null;
+          _chestPainCycles = 0;
+          _chestPainPumpsStartTime = null;
+        } else {
+          final isFist = leftFist || rightFist;
+          final isOpen = leftOpenPalm || rightOpenPalm;
+          final canShift = _chestPainPhaseTime == null || now.difference(_chestPainPhaseTime!).inMilliseconds >= 120;
+
+          if (_chestPainPhase == "WAIT_CLOSE") {
+            if (isFist && canShift) {
+              _chestPainPhase = "WAIT_OPEN";
+              _chestPainPhaseTime = now;
+            }
+          } else if (_chestPainPhase == "WAIT_OPEN") {
+            if (isOpen && canShift) {
+              _chestPainCycles++;
+              _chestPainPhaseTime = now;
+              if (_chestPainCycles >= 3) {
+                // CONFIRMED TRIGGER!
+                _chestPainPhase = "IDLE";
+                _chestPainHoldStart = null;
+                _chestPainCycles = 0;
+                _chestPainPumpsStartTime = null;
+                _chestPainPhaseTime = null;
+                _lastTriggered[DetectedGesture.chestPainDistress] = now;
+                return const GestureResult(
+                  gesture: DetectedGesture.chestPainDistress,
+                  eventType: 'chest_pain_distress',
+                  displayTitle: '⚠️ CHEST PAIN DISTRESS DETECTED',
+                  alertMessage: 'Patient held both hands on chest for 7s followed by 3 fist close-open cycles (Acute cardiac/chest distress).',
+                  isConfirmed: true,
+                  holdProgress: 1.0,
+                );
+              } else {
+                _chestPainPhase = "WAIT_CLOSE";
+              }
+            }
+          }
+
+          final cycleProgress = 0.50 + ((_chestPainCycles * 2 + (_chestPainPhase == "WAIT_OPEN" ? 1 : 0)) / 6.0) * 0.50;
+          final titleMsg = _chestPainPhase == "WAIT_CLOSE"
+              ? "✊ CLOSE FIST ($_chestPainCycles/3)"
+              : "🖐 OPEN FIST (${_chestPainCycles + 1}/3)";
+
           return GestureResult(
             gesture: DetectedGesture.chestPainDistress,
             eventType: 'chest_pain_distress',
-            displayTitle: 'HOLDING: Chest Pain Sign',
+            displayTitle: '⚠️ CHEST PAIN: $titleMsg',
             alertMessage: '',
             isConfirmed: false,
             isHolding: true,
-            holdProgress: progress,
-            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): CHEST PAIN SIGN',
-            holdColor: Colors.deepOrange,
+            holdProgress: cycleProgress.clamp(0.50, 0.98),
+            holdFeedbackText: '⚠️ CHEST PAIN: $titleMsg',
+            holdColor: Colors.red,
           );
         }
-      } else {
-        _chestPainGestureStart = null;
       }
+    } else {
+      _chestPainPhase = "IDLE";
+      _chestPainHoldStart = null;
+      _chestPainCycles = 0;
+      _chestPainPumpsStartTime = null;
     }
 
     // -------------------------------------------------------------
-    // 3. WATER REQUEST (पानी का इशारा - Hand Near Mouth) - Priority: BLUE
+    // 3. WATER REQUEST (ASL 'W' Sign: 3 Fingers Up, Thumb & Pinky Joined) - 5s Hold
     // -------------------------------------------------------------
-    if (!_isCoolingDown(DetectedGesture.waterRequest, now) && nose != null) {
-      bool handNearMouth = false;
-      if (leftWrist != null) {
-        final dist = _distance(leftWrist.x, leftWrist.y, nose.x, nose.y + (shoulderWidth * 0.15));
-        if (dist < shoulderWidth * 0.38) handNearMouth = true;
-      }
-      if (rightWrist != null) {
-        final dist = _distance(rightWrist.x, rightWrist.y, nose.x, nose.y + (shoulderWidth * 0.15));
-        if (dist < shoulderWidth * 0.38) handNearMouth = true;
-      }
+    if (!_isCoolingDown(DetectedGesture.waterRequest, now)) {
+      final rightWater = rightWaterSign && rightWrist != null && rightWrist.y < midHipY;
+      final leftWater = leftWaterSign && leftWrist != null && leftWrist.y < midHipY;
 
-      if (handNearMouth) {
+      if (rightWater || leftWater) {
         _waterGestureStart ??= now;
         final elapsed = now.difference(_waterGestureStart!).inMilliseconds;
-        final progress = (elapsed / holdDurationMs).clamp(0.0, 1.0);
+        final progress = (elapsed / waterHoldDurationMs).clamp(0.0, 1.0);
 
-        if (elapsed >= holdDurationMs) {
+        if (elapsed >= waterHoldDurationMs) {
           _waterGestureStart = null;
           _lastTriggered[DetectedGesture.waterRequest] = now;
           return const GestureResult(
             gesture: DetectedGesture.waterRequest,
             eventType: 'water_request',
-            displayTitle: '💧 WATER REQUESTED',
-            alertMessage: 'Patient is thirsty and requesting water / hydration assistance.',
+            displayTitle: '💧 WATER REQUESTED (ASL Sign)',
+            alertMessage: 'Patient showed 3 fingers with thumb and pinky joined (ASL Water Sign) for 5 seconds.',
             isConfirmed: true,
             holdProgress: 1.0,
           );
@@ -301,12 +402,12 @@ class GestureDetectionLogic {
           return GestureResult(
             gesture: DetectedGesture.waterRequest,
             eventType: 'water_request',
-            displayTitle: 'HOLDING: Water Request',
+            displayTitle: '💧 WATER SIGN (Hold 5s: $elapsedSec s / 5.0s)',
             alertMessage: '',
             isConfirmed: false,
             isHolding: true,
             holdProgress: progress,
-            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): 💧 WATER REQUEST',
+            holdFeedbackText: 'HOLD ($elapsedSec s / 5.0s): 💧 WATER REQUEST (ASL Sign)',
             holdColor: Colors.blue,
           );
         }
@@ -343,10 +444,10 @@ class GestureDetectionLogic {
         if (dist < shoulderWidth * 0.4) handOnAbdomen = true;
       }
 
-      // CRITICAL GUARD: If ANY raised hand is an open palm (🖐) or fist (✊) or active emergency phase, STRICTLY CANCEL washroom!
-      if ((rightWrist != null && rightWrist.y < rightShoulder.y && (rightOpenPalm || rightFist)) ||
-          (leftWrist != null && leftWrist.y < leftShoulder.y && (leftOpenPalm || leftFist)) ||
-          (_emergencyPhase != "IDLE")) {
+      // CRITICAL GUARD: If ANY raised hand is an open palm (🖐), fist (✊), water sign, or active emergency/chest/blanket phase, STRICTLY CANCEL washroom!
+      if ((rightWrist != null && rightWrist.y < rightShoulder.y && (rightOpenPalm || rightFist || rightWaterSign)) ||
+          (leftWrist != null && leftWrist.y < leftShoulder.y && (leftOpenPalm || leftFist || leftWaterSign)) ||
+          (_emergencyPhase != "IDLE" || _chestPainPhase != "IDLE" || _blanketGestureStart != null)) {
         oneFingerRaised = false;
         handOnAbdomen = false;
         _washroomGestureStart = null;
@@ -390,33 +491,33 @@ class GestureDetectionLogic {
     }
 
     // -------------------------------------------------------------
-    // 5. BLANKET / COLD (ठंड / चादर - Crossed Arms Hugging Self) - Priority: TEAL
+    // 5. BLANKET / COLD (Crossed Hands on Shoulders) - 7s Hold - Priority: TEAL
     // -------------------------------------------------------------
     if (!_isCoolingDown(DetectedGesture.blanketRequest, now)) {
-      bool armsCrossed = false;
+      bool armsCrossedOnShoulders = false;
       if (leftWrist != null && rightWrist != null) {
-        final leftCrossed = leftWrist.x > midShoulderX;
-        final rightCrossed = rightWrist.x < midShoulderX;
-        final wristsNearChest = (leftWrist.y - chestY).abs() < shoulderWidth * 0.6 &&
-                                (rightWrist.y - chestY).abs() < shoulderWidth * 0.6;
-        if (leftCrossed && rightCrossed && wristsNearChest) {
-          armsCrossed = true;
+        final leftOnRightShoulder = _distance(leftWrist.x, leftWrist.y, rightShoulder.x, rightShoulder.y) < shoulderWidth * 0.45;
+        final rightOnLeftShoulder = _distance(rightWrist.x, rightWrist.y, leftShoulder.x, leftShoulder.y) < shoulderWidth * 0.45;
+        final wristsNearShoulderLevel = (leftWrist.y - rightShoulder.y).abs() < shoulderWidth * 0.40 &&
+                                        (rightWrist.y - leftShoulder.y).abs() < shoulderWidth * 0.40;
+        if (leftOnRightShoulder && rightOnLeftShoulder && wristsNearShoulderLevel) {
+          armsCrossedOnShoulders = true;
         }
       }
 
-      if (armsCrossed) {
+      if (armsCrossedOnShoulders) {
         _blanketGestureStart ??= now;
         final elapsed = now.difference(_blanketGestureStart!).inMilliseconds;
-        final progress = (elapsed / holdDurationMs).clamp(0.0, 1.0);
+        final progress = (elapsed / blanketHoldDurationMs).clamp(0.0, 1.0);
 
-        if (elapsed >= holdDurationMs) {
+        if (elapsed >= blanketHoldDurationMs) {
           _blanketGestureStart = null;
           _lastTriggered[DetectedGesture.blanketRequest] = now;
           return const GestureResult(
             gesture: DetectedGesture.blanketRequest,
             eventType: 'blanket_request',
-            displayTitle: '🛌 BLANKET / COLD REPORTED',
-            alertMessage: 'Patient is feeling cold and requesting an extra blanket.',
+            displayTitle: '🛌 BLANKET / COLD ASSISTANCE',
+            alertMessage: 'Patient crossed arms with hands on shoulders for 7 seconds (feels cold, blanket requested).',
             isConfirmed: true,
             holdProgress: 1.0,
           );
@@ -425,12 +526,12 @@ class GestureDetectionLogic {
           return GestureResult(
             gesture: DetectedGesture.blanketRequest,
             eventType: 'blanket_request',
-            displayTitle: 'HOLDING: Blanket Request',
+            displayTitle: '🛌 BLANKET / COLD (Hold 7s: $elapsedSec s / 7.0s)',
             alertMessage: '',
             isConfirmed: false,
             isHolding: true,
             holdProgress: progress,
-            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): 🛌 BLANKET REQUEST',
+            holdFeedbackText: 'HOLD ($elapsedSec s / 7.0s): 🛌 HANDS CROSSED ON SHOULDERS',
             holdColor: Colors.teal,
           );
         }
@@ -446,7 +547,12 @@ class GestureDetectionLogic {
     _waterGestureStart = null;
     _washroomGestureStart = null;
     _blanketGestureStart = null;
-    _chestPainGestureStart = null;
+    _chestPainHoldStart = null;
+    _chestPainPhase = "IDLE";
+    _chestPainCycles = 0;
+    _chestPainPhaseTime = null;
+    _chestPainPumpsStartTime = null;
+    _chestPainLastHandsNear = null;
     _emergencyCycles = 0;
     _emergencyPhase = "IDLE";
     _emergencyPhaseTime = null;
@@ -463,10 +569,45 @@ class GestureDetectionLogic {
     return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
   }
 
-  bool _isOpenPalm(PoseLandmark? wrist, PoseLandmark? index, PoseLandmark? pinky, double shoulderWidth) {
+  bool _isWaterSign(
+    PoseLandmark? wrist,
+    PoseLandmark? index,
+    PoseLandmark? pinky,
+    PoseLandmark? thumb,
+    double shoulderWidth,
+  ) {
     if (wrist == null || index == null) return false;
     final idxUp = index.y < wrist.y - (shoulderWidth * 0.10);
     if (!idxUp) return false;
+
+    // In ASL 'W' / Water sign, thumb and pinky touch or join together
+    if (thumb != null && pinky != null) {
+      final thumbPinkyDist = _distance(thumb.x, thumb.y, pinky.x, pinky.y);
+      if (thumbPinkyDist < shoulderWidth * 0.14) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _isOpenPalm(
+    PoseLandmark? wrist,
+    PoseLandmark? index,
+    PoseLandmark? pinky,
+    PoseLandmark? thumb,
+    double shoulderWidth,
+  ) {
+    if (wrist == null || index == null) return false;
+    final idxUp = index.y < wrist.y - (shoulderWidth * 0.10);
+    if (!idxUp) return false;
+
+    // If thumb and pinky are joined, it is water sign, not open palm!
+    if (thumb != null && pinky != null) {
+      final thumbPinkyDist = _distance(thumb.x, thumb.y, pinky.x, pinky.y);
+      if (thumbPinkyDist < shoulderWidth * 0.14) {
+        return false;
+      }
+    }
 
     if (pinky != null) {
       final pinkyUp = pinky.y < wrist.y - (shoulderWidth * 0.08);
@@ -479,11 +620,25 @@ class GestureDetectionLogic {
     return true;
   }
 
-  bool _isOneFinger(PoseLandmark? wrist, PoseLandmark? index, PoseLandmark? pinky, double shoulderWidth) {
+  bool _isOneFinger(
+    PoseLandmark? wrist,
+    PoseLandmark? index,
+    PoseLandmark? pinky,
+    PoseLandmark? thumb,
+    double shoulderWidth,
+  ) {
     if (wrist == null || index == null) return false;
     final idxDist = _distance(index.x, index.y, wrist.x, wrist.y);
     final idxUp = index.y < wrist.y - (shoulderWidth * 0.12);
     if (!idxUp) return false;
+
+    // If thumb and pinky are touching, it is ASL water sign, not 1-finger!
+    if (thumb != null && pinky != null) {
+      final thumbPinkyDist = _distance(thumb.x, thumb.y, pinky.x, pinky.y);
+      if (thumbPinkyDist < shoulderWidth * 0.14) {
+        return false;
+      }
+    }
 
     // To confirm 1-finger (☝️), pinky MUST be visible and folded/curled near wrist
     if (pinky != null) {

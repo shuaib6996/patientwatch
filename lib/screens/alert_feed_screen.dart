@@ -29,15 +29,20 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
     try {
       final user = _authService.getCurrentUser();
       if (user != null) {
-        final doc = await FirebaseFirestore.instance.collection('staff').doc(user.uid).get();
+        final doc = await FirebaseFirestore.instance
+            .collection('staff')
+            .doc(user.uid)
+            .get();
         if (doc.exists) {
           _currentStaff = Staff.fromMap(doc.data()!, doc.id);
         }
       }
-      
+
       // Pre-load patients for fast lookups
-      final patientsSnap = await FirebaseFirestore.instance.collection('patients').get();
-      _allPatients = patientsSnap.docs.map((d) => Patient.fromFirestore(d)).toList();
+      final patientsSnap =
+          await FirebaseFirestore.instance.collection('patients').get();
+      _allPatients =
+          patientsSnap.docs.map((d) => Patient.fromFirestore(d)).toList();
     } catch (e) {
       debugPrint("Error loading initial data: $e");
     } finally {
@@ -131,13 +136,15 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
     }
   }
 
-  Future<void> _confirmDeleteAlert(BuildContext context, DocumentReference ref) async {
+  Future<void> _confirmDeleteAlert(
+      BuildContext context, DocumentReference ref) async {
     final messenger = ScaffoldMessenger.of(context);
     final shouldDelete = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Delete Alert'),
-        content: const Text('Are you sure you want to delete this notification?'),
+        content:
+            const Text('Are you sure you want to delete this notification?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -172,7 +179,8 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Clear All Alerts'),
-        content: const Text('Are you sure you want to delete ALL alert notifications? This cannot be undone.'),
+        content: const Text(
+            'Are you sure you want to delete ALL alert notifications? This cannot be undone.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -181,7 +189,8 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete All', style: TextStyle(color: Colors.white)),
+            child:
+                const Text('Delete All', style: TextStyle(color: Colors.white)),
           ),
         ],
       ),
@@ -189,7 +198,8 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
 
     if (shouldClear == true) {
       try {
-        final snap = await FirebaseFirestore.instance.collection('patient_events').get();
+        final snap =
+            await FirebaseFirestore.instance.collection('patient_events').get();
         final batch = FirebaseFirestore.instance.batch();
         for (final doc in snap.docs) {
           batch.delete(doc.reference);
@@ -225,7 +235,8 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
                   Icon(Icons.circle, color: Colors.green, size: 10),
                   SizedBox(width: 6),
                   Text('Live Alert Feed',
-                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                      style:
+                          TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
                 ],
               ),
               TextButton.icon(
@@ -234,7 +245,8 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
                   visualDensity: VisualDensity.compact,
                 ),
                 icon: const Icon(Icons.delete_sweep, size: 18),
-                label: const Text('Clear All', style: TextStyle(fontWeight: FontWeight.bold)),
+                label: const Text('Clear All',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
                 onPressed: () => _confirmClearAllAlerts(context),
               ),
             ],
@@ -297,7 +309,8 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
                         const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
                     child: ListTile(
                       leading: CircleAvatar(
-                        backgroundColor: _getEventColor(type).withValues(alpha: 0.2),
+                        backgroundColor:
+                            _getEventColor(type).withValues(alpha: 0.2),
                         child: Icon(_getEventIcon(type),
                             color: _getEventColor(type)),
                       ),
@@ -310,12 +323,16 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Text(timeStr, style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          Text(timeStr,
+                              style: const TextStyle(
+                                  fontSize: 12, color: Colors.grey)),
                           const SizedBox(width: 4),
                           IconButton(
-                            icon: const Icon(Icons.delete_outline, color: Colors.red, size: 22),
+                            icon: const Icon(Icons.delete_outline,
+                                color: Colors.red, size: 22),
                             tooltip: 'Delete Alert',
-                            onPressed: () => _confirmDeleteAlert(context, events[index].reference),
+                            onPressed: () => _confirmDeleteAlert(
+                                context, events[index].reference),
                           ),
                         ],
                       ),
