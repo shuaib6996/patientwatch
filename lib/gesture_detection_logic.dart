@@ -61,9 +61,11 @@ class GestureDetectionLogic {
   DateTime? _blanketGestureStart;
   DateTime? _chestPainGestureStart;
 
-  // Wave detection tracking: list of timestamped wrist X positions
-  final List<double> _wristXHistory = [];
-  final List<DateTime> _wristTimeHistory = [];
+  // Emergency Help tracking: 3 Open-Close cycles
+  int _emergencyCycles = 0;
+  String _emergencyPhase = "IDLE"; // "IDLE", "WAIT_CLOSE", "WAIT_OPEN"
+  DateTime? _emergencyPhaseTime;
+  DateTime? _emergencyStartTime;
 
   GestureResult detectGesture(Pose pose) {
     if (pose.landmarks.isEmpty) {
@@ -82,6 +84,10 @@ class GestureDetectionLogic {
     final rightWrist = pose.landmarks[PoseLandmarkType.rightWrist];
     final leftHip = pose.landmarks[PoseLandmarkType.leftHip];
     final rightHip = pose.landmarks[PoseLandmarkType.rightHip];
+    final leftIndex = pose.landmarks[PoseLandmarkType.leftIndex];
+    final rightIndex = pose.landmarks[PoseLandmarkType.rightIndex];
+    final leftPinky = pose.landmarks[PoseLandmarkType.leftPinky];
+    final rightPinky = pose.landmarks[PoseLandmarkType.rightPinky];
 
     if (leftShoulder == null || rightShoulder == null) {
       _resetHoldTimers();
@@ -108,41 +114,106 @@ class GestureDetectionLogic {
     final chestX = midShoulderX;
     final chestY = midShoulderY + (midHipY - midShoulderY) * 0.35;
 
+    // Hand shape classification
+    final leftOpenPalm = _isOpenPalm(leftWrist, leftIndex, leftPinky, shoulderWidth);
+    final rightOpenPalm = _isOpenPalm(rightWrist, rightIndex, rightPinky, shoulderWidth);
+    final leftFist = _isFist(leftWrist, leftIndex, leftPinky, shoulderWidth);
+    final rightFist = _isFist(rightWrist, rightIndex, rightPinky, shoulderWidth);
+    final leftOneFinger = _isOneFinger(leftWrist, leftIndex, leftPinky, shoulderWidth);
+    final rightOneFinger = _isOneFinger(rightWrist, rightIndex, rightPinky, shoulderWidth);
+
     // -------------------------------------------------------------
-    // 1. EMERGENCY HELP WAVE (हाथ हिलाकर मदद मांगना) - Priority: RED
+    // 1. EMERGENCY HELP: 3 OPEN & CLOSE FIST CYCLES (🖐 -> ✊ -> 🖐 x3)
     // -------------------------------------------------------------
     if (!_isCoolingDown(DetectedGesture.emergencyHelpWave, now)) {
-      final leftHandAboveHead = leftWrist != null && leftWrist.y < leftShoulder.y - (shoulderWidth * 0.2);
-      final rightHandAboveHead = rightWrist != null && rightWrist.y < rightShoulder.y - (shoulderWidth * 0.2);
+      final leftHandAboveHead = leftWrist != null && leftWrist.y < leftShoulder.y - (shoulderWidth * 0.15);
+      final rightHandAboveHead = rightWrist != null && rightWrist.y < rightShoulder.y - (shoulderWidth * 0.15);
 
       if (leftHandAboveHead || rightHandAboveHead) {
-        final activeWrist = rightHandAboveHead ? rightWrist : leftWrist!;
+        final isOpen = rightHandAboveHead ? rightOpenPalm : leftOpenPalm;
+        final isFist = rightHandAboveHead ? rightFist : leftFist;
 
-        _wristXHistory.add(activeWrist.x);
-        _wristTimeHistory.add(now);
-
-        // Keep last 2 seconds of history
-        while (_wristTimeHistory.isNotEmpty && now.difference(_wristTimeHistory.first).inMilliseconds > 2000) {
-          _wristXHistory.removeAt(0);
-          _wristTimeHistory.removeAt(0);
+        // Reset if total interaction takes more than 10 seconds
+        if (_emergencyStartTime != null && now.difference(_emergencyStartTime!).inMilliseconds > 10000) {
+          _emergencyCycles = 0;
+          _emergencyPhase = "IDLE";
+          _emergencyStartTime = null;
         }
 
-        if (_isOscillatingWave(_wristXHistory, shoulderWidth * 0.25)) {
-          _wristXHistory.clear();
-          _wristTimeHistory.clear();
-          _lastTriggered[DetectedGesture.emergencyHelpWave] = now;
+        final canShift = (_emergencyPhaseTime == null) || (now.difference(_emergencyPhaseTime!).inMilliseconds >= 120);
+
+        if (_emergencyPhase == "IDLE") {
+          if (isOpen) {
+            _emergencyPhase = "WAIT_CLOSE";
+            _emergencyPhaseTime = now;
+            _emergencyStartTime = now;
+            _emergencyCycles = 0;
+          }
+        } else if (_emergencyPhase == "WAIT_CLOSE") {
+          if (isFist && canShift) {
+            _emergencyPhase = "WAIT_OPEN";
+            _emergencyPhaseTime = now;
+          }
+        } else if (_emergencyPhase == "WAIT_OPEN") {
+          if (isOpen && canShift) {
+            _emergencyCycles++;
+            _emergencyPhaseTime = now;
+
+            if (_emergencyCycles >= 3) {
+              _emergencyCycles = 0;
+              _emergencyPhase = "IDLE";
+              _emergencyStartTime = null;
+              _emergencyPhaseTime = null;
+              _lastTriggered[DetectedGesture.emergencyHelpWave] = now;
+              return const GestureResult(
+                gesture: DetectedGesture.emergencyHelpWave,
+                eventType: 'emergency_help_wave',
+                displayTitle: '🚨 EMERGENCY HELP DETECTED',
+                alertMessage: 'Patient opened and closed hand 3 times! Immediate emergency assistance requested.',
+                isConfirmed: true,
+                holdProgress: 1.0,
+              );
+            } else {
+              _emergencyPhase = "WAIT_CLOSE";
+            }
+          }
+        }
+
+        if (_emergencyPhase != "IDLE") {
+          final cycleProgress = (_emergencyCycles * 2 + (_emergencyPhase == "WAIT_OPEN" ? 1 : 0)) / 6.0;
+          final titleMsg = _emergencyPhase == "WAIT_CLOSE"
+              ? (_emergencyCycles == 0 ? "🖐 EMERGENCY: CLOSE FIST (0/3)" : "🚨 EMERGENCY: CLOSE FIST ($_emergencyCycles/3)")
+              : "✊ NOW OPEN HAND (${_emergencyCycles + 1}/3)";
+
+          return GestureResult(
+            gesture: DetectedGesture.emergencyHelpWave,
+            eventType: 'emergency_help_wave',
+            displayTitle: titleMsg,
+            alertMessage: '',
+            isConfirmed: false,
+            isHolding: true,
+            holdProgress: cycleProgress.clamp(0.12, 1.0),
+            holdFeedbackText: titleMsg,
+            holdColor: Colors.red,
+          );
+        } else {
           return const GestureResult(
             gesture: DetectedGesture.emergencyHelpWave,
             eventType: 'emergency_help_wave',
-            displayTitle: '🚨 HELP WAVE DETECTED',
-            alertMessage: 'Patient is waving for emergency help! Immediate assistance required.',
-            isConfirmed: true,
-            holdProgress: 1.0,
+            displayTitle: '🖐 HAND UP: Open & Close Fist 3x for Help',
+            alertMessage: '',
+            isConfirmed: false,
+            isHolding: true,
+            holdProgress: 0.08,
+            holdFeedbackText: '🖐 HAND UP: Open & Close Fist 3 times for Emergency Help',
+            holdColor: Colors.orange,
           );
         }
       } else {
-        _wristXHistory.clear();
-        _wristTimeHistory.clear();
+        _emergencyCycles = 0;
+        _emergencyPhase = "IDLE";
+        _emergencyStartTime = null;
+        _emergencyPhaseTime = null;
       }
     }
 
@@ -245,18 +316,20 @@ class GestureDetectionLogic {
     }
 
     // -------------------------------------------------------------
-    // 4. WASHROOM / TOILET REQUEST (टॉयलेट जाना है - Steady Raised Hand or Pelvic Sign) - Priority: AMBER
+    // 4. WASHROOM / TOILET REQUEST (☝️ 1 Finger Only OR Pelvic Sign) - Priority: AMBER
     // -------------------------------------------------------------
     if (!_isCoolingDown(DetectedGesture.washroomRequest, now)) {
-      // Steady raised hand (forearm upright without waving) OR hand resting over lower abdomen
-      bool steadyRaisedHand = false;
-      if (rightWrist != null && rightElbow != null) {
-        final isUpright = rightWrist.y < rightElbow.y && (rightWrist.x - rightElbow.x).abs() < shoulderWidth * 0.4;
-        if (isUpright && rightWrist.y < rightShoulder.y) steadyRaisedHand = true;
+      // 1-Finger Raised Sign (Index finger UP, pinky curled down)
+      bool oneFingerRaised = false;
+      if (rightWrist != null && rightElbow != null && rightWrist.y < rightShoulder.y && rightWrist.y < rightElbow.y) {
+        if (rightOneFinger && !rightOpenPalm) {
+          oneFingerRaised = true;
+        }
       }
-      if (leftWrist != null && leftElbow != null) {
-        final isUpright = leftWrist.y < leftElbow.y && (leftWrist.x - leftElbow.x).abs() < shoulderWidth * 0.4;
-        if (isUpright && leftWrist.y < leftShoulder.y) steadyRaisedHand = true;
+      if (leftWrist != null && leftElbow != null && leftWrist.y < leftShoulder.y && leftWrist.y < leftElbow.y) {
+        if (leftOneFinger && !leftOpenPalm) {
+          oneFingerRaised = true;
+        }
       }
 
       // Hand on lower abdomen (pelvic area)
@@ -270,7 +343,16 @@ class GestureDetectionLogic {
         if (dist < shoulderWidth * 0.4) handOnAbdomen = true;
       }
 
-      if (steadyRaisedHand || handOnAbdomen) {
+      // CRITICAL GUARD: If ANY raised hand is an open palm (🖐) or fist (✊) or active emergency phase, STRICTLY CANCEL washroom!
+      if ((rightWrist != null && rightWrist.y < rightShoulder.y && (rightOpenPalm || rightFist)) ||
+          (leftWrist != null && leftWrist.y < leftShoulder.y && (leftOpenPalm || leftFist)) ||
+          (_emergencyPhase != "IDLE")) {
+        oneFingerRaised = false;
+        handOnAbdomen = false;
+        _washroomGestureStart = null;
+      }
+
+      if (oneFingerRaised || handOnAbdomen) {
         _washroomGestureStart ??= now;
         final elapsed = now.difference(_washroomGestureStart!).inMilliseconds;
         final progress = (elapsed / holdDurationMs).clamp(0.0, 1.0);
@@ -278,25 +360,27 @@ class GestureDetectionLogic {
         if (elapsed >= holdDurationMs) {
           _washroomGestureStart = null;
           _lastTriggered[DetectedGesture.washroomRequest] = now;
-          return const GestureResult(
+          final desc = oneFingerRaised ? '1-finger signal' : 'pelvic sign';
+          return GestureResult(
             gesture: DetectedGesture.washroomRequest,
             eventType: 'washroom_request',
             displayTitle: '🚻 WASHROOM ASSISTANCE REQUESTED',
-            alertMessage: 'Patient needs toilet / washroom assistance. Routine care needed.',
+            alertMessage: 'Patient needs toilet / washroom assistance ($desc). Routine care needed.',
             isConfirmed: true,
             holdProgress: 1.0,
           );
         } else {
           final elapsedSec = (elapsed / 1000.0).toStringAsFixed(1);
+          final desc = oneFingerRaised ? '☝️ 1 FINGER' : 'PELVIC HAND';
           return GestureResult(
             gesture: DetectedGesture.washroomRequest,
             eventType: 'washroom_request',
-            displayTitle: 'HOLDING: Washroom Request',
+            displayTitle: 'HOLDING: Washroom Request ($desc)',
             alertMessage: '',
             isConfirmed: false,
             isHolding: true,
             holdProgress: progress,
-            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): 🚻 WASHROOM REQUEST',
+            holdFeedbackText: 'HOLD ($elapsedSec s / 3.0s): 🚻 WASHROOM REQUEST ($desc)',
             holdColor: Colors.amber.shade800,
           );
         }
@@ -363,8 +447,10 @@ class GestureDetectionLogic {
     _washroomGestureStart = null;
     _blanketGestureStart = null;
     _chestPainGestureStart = null;
-    _wristXHistory.clear();
-    _wristTimeHistory.clear();
+    _emergencyCycles = 0;
+    _emergencyPhase = "IDLE";
+    _emergencyPhaseTime = null;
+    _emergencyStartTime = null;
   }
 
   bool _isCoolingDown(DetectedGesture gesture, DateTime now) {
@@ -377,25 +463,65 @@ class GestureDetectionLogic {
     return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
   }
 
-  bool _isOscillatingWave(List<double> xVals, double minAmplitude) {
-    if (xVals.length < 8) return false;
+  bool _isOpenPalm(PoseLandmark? wrist, PoseLandmark? index, PoseLandmark? pinky, double shoulderWidth) {
+    if (wrist == null || index == null) return false;
+    final idxUp = index.y < wrist.y - (shoulderWidth * 0.10);
+    if (!idxUp) return false;
 
-    // Detect direction reversals (peaks and valleys)
-    int reversals = 0;
-    double? lastDir;
+    if (pinky != null) {
+      final pinkyUp = pinky.y < wrist.y - (shoulderWidth * 0.08);
+      final span = _distance(index.x, index.y, pinky.x, pinky.y);
+      if (pinkyUp && span > (shoulderWidth * 0.15)) {
+        return true;
+      }
+    }
+    // If pinky is missing or low confidence, default to open palm so it won't be mistaken for 1-finger
+    return true;
+  }
 
-    for (int i = 1; i < xVals.length; i++) {
-      final diff = xVals[i] - xVals[i - 1];
-      if (diff.abs() > 3.0) {
-        final currentDir = diff > 0 ? 1.0 : -1.0;
-        if (lastDir != null && currentDir != lastDir) {
-          reversals++;
-        }
-        lastDir = currentDir;
+  bool _isOneFinger(PoseLandmark? wrist, PoseLandmark? index, PoseLandmark? pinky, double shoulderWidth) {
+    if (wrist == null || index == null) return false;
+    final idxDist = _distance(index.x, index.y, wrist.x, wrist.y);
+    final idxUp = index.y < wrist.y - (shoulderWidth * 0.12);
+    if (!idxUp) return false;
+
+    // To confirm 1-finger (☝️), pinky MUST be visible and folded/curled near wrist
+    if (pinky != null) {
+      final pinkyDist = _distance(pinky.x, pinky.y, wrist.x, wrist.y);
+      final pinkyUp = pinky.y < wrist.y - (shoulderWidth * 0.08);
+      final span = _distance(index.x, index.y, pinky.x, pinky.y);
+
+      // If pinky is clearly up and wide span, this is open hand, NOT one finger
+      if (pinkyUp && span > (shoulderWidth * 0.15)) {
+        return false;
+      }
+
+      // One finger: index is up, pinky is curled down
+      if (!pinkyUp || pinkyDist < idxDist * 0.65 || span < (shoulderWidth * 0.12)) {
+        return true;
       }
     }
 
-    final range = xVals.reduce(max) - xVals.reduce(min);
-    return reversals >= 3 && range >= minAmplitude;
+    // If pinky is not detected, never assume one finger!
+    return false;
+  }
+
+  bool _isFist(PoseLandmark? wrist, PoseLandmark? index, PoseLandmark? pinky, double shoulderWidth) {
+    if (wrist == null) return false;
+    final idxUp = index != null && (index.y < wrist.y - (shoulderWidth * 0.10));
+    final pinkyUp = pinky != null && (pinky.y < wrist.y - (shoulderWidth * 0.08));
+
+    // When all fingers are curled/contracted into fist
+    if (!idxUp && !pinkyUp) {
+      return true;
+    }
+
+    if (index != null) {
+      final idxDist = _distance(index.x, index.y, wrist.x, wrist.y);
+      if (idxDist < shoulderWidth * 0.15) {
+        return true;
+      }
+    }
+    return false;
   }
 }
