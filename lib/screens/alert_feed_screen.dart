@@ -216,6 +216,82 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
     }
   }
 
+  void _showGestureGuideDialog(BuildContext context) {
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: Container(
+          decoration: BoxDecoration(
+            color: const Color(0xFF0F172A),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    const Row(
+                      children: [
+                        Icon(Icons.menu_book_rounded,
+                            color: Colors.cyanAccent, size: 20),
+                        SizedBox(width: 8),
+                        Text(
+                          'Patient Gesture Guide',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                      ],
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close, color: Colors.white70),
+                      onPressed: () => Navigator.pop(ctx),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ],
+                ),
+              ),
+              const Divider(color: Colors.white24, height: 1),
+              Flexible(
+                child: InteractiveViewer(
+                  panEnabled: true,
+                  minScale: 0.8,
+                  maxScale: 4.0,
+                  child: Padding(
+                    padding: const EdgeInsets.all(8.0),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(12),
+                      child: Image.asset(
+                        'assets/images/patient_gesture_infographic.jpg',
+                        fit: BoxFit.contain,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              Padding(
+                padding:
+                    const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+                child: Text(
+                  'Pinch or double-tap to zoom into gesture instructions.',
+                  style: TextStyle(color: Colors.grey.shade400, fontSize: 12),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_isLoadingStaff) {
@@ -239,15 +315,30 @@ class _AlertFeedScreenState extends State<AlertFeedScreen> {
                           TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
                 ],
               ),
-              TextButton.icon(
-                style: TextButton.styleFrom(
-                  foregroundColor: Colors.red,
-                  visualDensity: VisualDensity.compact,
-                ),
-                icon: const Icon(Icons.delete_sweep, size: 18),
-                label: const Text('Clear All',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                onPressed: () => _confirmClearAllAlerts(context),
+              Row(
+                children: [
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.teal.shade800,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    icon: const Icon(Icons.menu_book_rounded, size: 18),
+                    label: const Text('Gesture Guide',
+                        style: TextStyle(fontWeight: FontWeight.bold)),
+                    onPressed: () => _showGestureGuideDialog(context),
+                  ),
+                  const SizedBox(width: 4),
+                  TextButton.icon(
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.red,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    icon: const Icon(Icons.delete_sweep, size: 18),
+                    label: const Text('Clear All',
+                        style: TextStyle(fontWeight: FontWeight.bold)),
+                    onPressed: () => _confirmClearAllAlerts(context),
+                  ),
+                ],
               ),
             ],
           ),
