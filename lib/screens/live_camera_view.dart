@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -21,11 +22,78 @@ class _LiveCameraViewState extends State<LiveCameraView> {
   StreamSubscription? _mjpegSubscription;
   Uint8List? _latestFrame;
   bool _isError = false;
+  bool _isTargetLocked = false;
 
   @override
   void initState() {
     super.initState();
     _startMjpegStream();
+    _checkInitialTargetStatus();
+  }
+
+  Future<void> _checkInitialTargetStatus() async {
+    try {
+      final url = Uri.parse('http://100.97.64.92:8000/cameras/target/status?camera_id=${widget.patient.deviceId}');
+      final resp = await http.get(url).timeout(const Duration(seconds: 2));
+      if (resp.statusCode == 200) {
+        final data = jsonDecode(resp.body);
+        if (mounted && data is Map && data['locked'] == true) {
+          setState(() => _isTargetLocked = true);
+        }
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _lockTargetAt(double normX, double normY) async {
+    try {
+      final url = Uri.parse('http://100.97.64.92:8000/cameras/target/lock');
+      final resp = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'camera_id': widget.patient.deviceId,
+          'x': normX,
+          'y': normY,
+        }),
+      ).timeout(const Duration(seconds: 3));
+      if (resp.statusCode == 200 && mounted) {
+        setState(() => _isTargetLocked = true);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('🎯 Target Patient Locked! System focusing on patient.'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error locking target: $e');
+    }
+  }
+
+  Future<void> _toggleTargetLock() async {
+    if (_isTargetLocked) {
+      try {
+        final url = Uri.parse('http://100.97.64.92:8000/cameras/target/unlock');
+        await http.post(
+          url,
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'camera_id': widget.patient.deviceId}),
+        ).timeout(const Duration(seconds: 3));
+        if (mounted) {
+          setState(() => _isTargetLocked = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('🔓 Target Unlocked. Returned to free mode.'),
+              duration: Duration(seconds: 2),
+            ),
+          );
+        }
+      } catch (e) {
+        debugPrint('Error unlocking target: $e');
+      }
+    } else {
+      _lockTargetAt(0.5, 0.5);
+    }
   }
 
   @override
@@ -97,6 +165,14 @@ class _LiveCameraViewState extends State<LiveCameraView> {
     return Scaffold(
       appBar: AppBar(
         title: Text('${widget.patient.name} (Rm: ${widget.patient.roomNumber})'),
+        actions: [
+          IconButton(
+            icon: Icon(_isTargetLocked ? Icons.lock_rounded : Icons.track_changes_rounded),
+            color: _isTargetLocked ? Colors.greenAccent : Colors.white,
+            tooltip: _isTargetLocked ? 'Target Locked (Tap to Unlock)' : 'Lock Patient Target',
+            onPressed: _toggleTargetLock,
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -115,10 +191,52 @@ class _LiveCameraViewState extends State<LiveCameraView> {
                     )
                   : _latestFrame == null
                       ? const Center(child: CircularProgressIndicator())
-                      : Image.memory(
-                          _latestFrame!,
-                          gaplessPlayback: true,
-                          fit: BoxFit.contain,
+                      : LayoutBuilder(
+                          builder: (context, constraints) {
+                            return GestureDetector(
+                              onTapUp: (details) {
+                                final normX = (details.localPosition.dx / constraints.maxWidth).clamp(0.0, 1.0);
+                                final normY = (details.localPosition.dy / constraints.maxHeight).clamp(0.0, 1.0);
+                                _lockTargetAt(normX, normY);
+                              },
+                              child: Stack(
+                                children: [
+                                  Center(
+                                    child: Image.memory(
+                                      _latestFrame!,
+                                      gaplessPlayback: true,
+                                      fit: BoxFit.contain,
+                                    ),
+                                  ),
+                                  Positioned(
+                                    bottom: 8,
+                                    left: 8,
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(
+                                        color: Colors.black87,
+                                        borderRadius: BorderRadius.circular(4),
+                                        border: Border.all(
+                                          color: _isTargetLocked ? Colors.greenAccent : Colors.white24,
+                                          width: 1,
+                                        ),
+                                      ),
+                                      child: Text(
+                                        _isTargetLocked
+                                            ? '🎯 TARGET LOCKED (Tap to re-target)'
+                                            : '💡 Tap patient to lock focus',
+                                        style: TextStyle(
+                                          color: _isTargetLocked ? Colors.greenAccent : Colors.white70,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
                         ),
             ),
           ),
